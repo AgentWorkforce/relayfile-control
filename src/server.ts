@@ -15,7 +15,7 @@ async function main(): Promise<void> {
   if (!config.DATABASE_URL) throw new Error("DATABASE_URL is required");
   logger.event("starting", { area: "server", config: redactedConfig(config) });
 
-  const db = pgDb(config.DATABASE_URL, { max: config.DATABASE_POOL_MAX });
+  const db = pgDb(config.DATABASE_URL, { max: config.DATABASE_POOL_MAX, statementTimeoutMs: config.DATABASE_STATEMENT_TIMEOUT_MS });
   if (config.MIGRATE_ON_START) {
     const applied = await migrate(db);
     logger.event("migrated", { area: "server", applied });
@@ -50,8 +50,9 @@ async function main(): Promise<void> {
   let consumer: Consumer | null = null;
   let sweeper: Sweeper | null = null;
   if (config.ROLE !== "ingress") {
-    const relayfile = config.RELAYFILE_INTERNAL_HMAC_SECRET ? new RelayfileClient({ hmacSecret: config.RELAYFILE_INTERNAL_HMAC_SECRET, retry503: config.RELAYFILE_BACKPRESSURE_RETRY_503 }) : null;
-    if (!relayfile) logger.event("relayfile_not_configured", { area: "server", reason: "RELAYFILE_INTERNAL_HMAC_SECRET unset" });
+    // A consumer without the Relayfile secret would claim and dead-letter every envelope.
+    if (!config.RELAYFILE_INTERNAL_HMAC_SECRET) throw new Error("RELAYFILE_INTERNAL_HMAC_SECRET is required for ROLE=consumer|all");
+    const relayfile = new RelayfileClient({ hmacSecret: config.RELAYFILE_INTERNAL_HMAC_SECRET, retry503: config.RELAYFILE_BACKPRESSURE_RETRY_503 });
     consumer = new Consumer({ db, config, logger, metrics: app.metrics, entitlement, cooldowns: app.cooldowns, relayfile });
     sweeper = new Sweeper({ db, config, logger, metrics: app.metrics, cooldowns: app.cooldowns, depth: app.depth });
     consumer.start();

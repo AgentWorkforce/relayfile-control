@@ -10,6 +10,12 @@ export const DEFAULT_MIGRATIONS_DIR = path.resolve(path.dirname(fileURLToPath(im
 
 export async function listMigrations(dir = DEFAULT_MIGRATIONS_DIR): Promise<{ version: string; file: string }[]> {
   const files = (await readdir(dir)).filter((name) => /^\d{4}_[a-z0-9_]+\.sql$/.test(name)).sort();
+  const seen = new Set<string>();
+  for (const file of files) {
+    const version = file.slice(0, 4);
+    if (seen.has(version)) throw new Error(`duplicate migration version ${version}`);
+    seen.add(version);
+  }
   return files.map((file) => ({ version: file.slice(0, 4), file: path.join(dir, file) }));
 }
 
@@ -18,12 +24,11 @@ export async function listMigrations(dir = DEFAULT_MIGRATIONS_DIR): Promise<{ ve
  * session advisory lock so concurrently starting pods never race.
  */
 export async function migrate(db: Db, dir = DEFAULT_MIGRATIONS_DIR): Promise<string[]> {
-  await db.exec(
-    "CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
-  );
   const applied: string[] = [];
   await db.tx(async (q) => {
+    // Lock first: even `CREATE TABLE IF NOT EXISTS` races between concurrent migrators (23505 on pg_type).
     await q.query("SELECT pg_advisory_xact_lock($1)", [MIGRATION_LOCK_ID]);
+    await q.query("CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())");
     const done = new Set((await q.query<{ version: string }>("SELECT version FROM schema_migrations")).rows.map((r) => r.version));
     for (const migration of await listMigrations(dir)) {
       if (done.has(migration.version)) continue;

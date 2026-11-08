@@ -19,17 +19,24 @@ FROM ${NODE_IMAGE} AS runtime
 ARG IMAGE_REVISION=unknown
 ARG IMAGE_VERSION=0.1.0-dev
 WORKDIR /app
-ENV NODE_ENV=production LISTEN=0.0.0.0:3100 ADMIN_LISTEN=0.0.0.0:3101
+# ADMIN_LISTEN keeps its loopback default; a deployment that scrapes /metrics sets it explicitly.
+ENV NODE_ENV=production LISTEN=0.0.0.0:3100
 LABEL org.opencontainers.image.source="https://github.com/AgentWorkforce/relayfile-control" \
       org.opencontainers.image.revision="${IMAGE_REVISION}" \
       org.opencontainers.image.version="${IMAGE_VERSION}"
 COPY --from=build /tmp/relayfile-control-0.1.0.tgz /tmp/package.tgz
-RUN npm init -y >/dev/null \
- && npm install --omit=dev --ignore-scripts --no-audit --no-fund /tmp/package.tgz \
- && rm /tmp/package.tgz \
+COPY package-lock.json /tmp/package-lock.json
+# Install the packed package with the versions the tests validated: unpack it,
+# put the committed lockfile beside it, and `npm ci` its production deps.
+RUN mkdir -p node_modules/@relayfile/control \
+ && tar -xzf /tmp/package.tgz -C node_modules/@relayfile/control --strip-components=1 \
+ && cp /tmp/package-lock.json node_modules/@relayfile/control/package-lock.json \
+ && cd node_modules/@relayfile/control \
+ && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+ && rm /tmp/package.tgz /tmp/package-lock.json \
  && chown -R node:node /app
 USER node
-EXPOSE 3100 3101
+EXPOSE 3100
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+process.env.LISTEN.split(':').pop()+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 CMD ["node", "node_modules/@relayfile/control/dist/server.js"]

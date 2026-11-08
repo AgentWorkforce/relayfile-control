@@ -51,6 +51,9 @@ CREATE INDEX webhook_envelopes_received_idx ON webhook_envelopes (received_at);
 CREATE INDEX webhook_envelopes_leased_idx ON webhook_envelopes (lease_until) WHERE state = 'leased';
 CREATE INDEX webhook_envelopes_dead_idx ON webhook_envelopes (updated_at) WHERE state = 'dead';
 CREATE INDEX webhook_envelopes_queued_received_idx ON webhook_envelopes (received_at) WHERE state = 'queued';
+CREATE INDEX webhook_envelopes_done_idx ON webhook_envelopes (updated_at) WHERE state = 'done';
+CREATE INDEX webhook_envelopes_blob_idx ON webhook_envelopes (payload_blob_id) WHERE payload_blob_id IS NOT NULL;
+CREATE INDEX webhook_envelopes_lane_queued_idx ON webhook_envelopes (lane, visible_at) WHERE state = 'queued';
 
 -- §3 idempotency: ingress dedupe and handler claims share one table.
 CREATE TABLE webhook_delivery_claims (
@@ -134,6 +137,8 @@ CREATE TABLE webhook_dlq_archive (
 );
 CREATE INDEX webhook_dlq_archive_lane_idx ON webhook_dlq_archive (lane, archived_at);
 CREATE INDEX webhook_dlq_archive_provider_idx ON webhook_dlq_archive (provider, archived_at);
+CREATE INDEX webhook_dlq_archive_blob_idx ON webhook_dlq_archive (payload_blob_id) WHERE payload_blob_id IS NOT NULL;
+CREATE INDEX webhook_dlq_archive_archived_idx ON webhook_dlq_archive (archived_at);
 
 -- Operator switches shared by every pod (ingress pause, §6.4 / §9).
 CREATE TABLE service_flags (

@@ -30,8 +30,8 @@ Postgres webhook_envelopes (the queue)
 `ROLE=ingress|consumer|all` (default `all`). The public listener (`LISTEN`,
 default `0.0.0.0:3100`) serves `/api/v1/webhooks/*`, their `/cloud/...`
 aliases, `/healthz` and `/readyz`. The internal listener (`ADMIN_LISTEN`,
-default `127.0.0.1:3101`) serves `/metrics` and `/api/v1/admin/*`, which need
-a bearer token. See `openapi.yaml`.
+default `127.0.0.1:3101`) serves `/metrics` (unauthenticated: protected only by
+the listener binding) and `/api/v1/admin/*` (bearer token). See `openapi.yaml`.
 
 ## Configuration
 

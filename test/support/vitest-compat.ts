@@ -105,6 +105,14 @@ export function expect(actual: unknown) {
             error = e;
           }
           if (!threw) assert.fail("expected promise to reject");
+          if (prop === "toThrow") {
+            // vitest semantics: the rejection value is the thrown error; it is not a function to call.
+            if (!(error instanceof Error)) assert.fail(`expected rejection with an Error, got ${String(error)}`);
+            const [expected] = args;
+            if (typeof expected === "string" && !error.message.includes(expected)) assert.fail(`expected "${error.message}" to include "${expected}"`);
+            if (expected instanceof RegExp && !expected.test(error.message)) assert.fail(`expected "${error.message}" to match ${expected}`);
+            return;
+          }
           (matchers(error, false) as unknown as Record<string, (...a: unknown[]) => void>)[prop]!(...args);
         },
       },

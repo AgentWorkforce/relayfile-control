@@ -73,6 +73,18 @@ const ReplaySchema = z
   })
   .strict();
 
+class InvalidQueryError extends Error {}
+
+/** `limit` query param: absent → default; otherwise an integer in [1, max], else 400. */
+function limitParam(url: URL, def = 100, max = 1000): number {
+  const raw = url.searchParams.get("limit");
+  if (raw === null || raw === "") return def;
+  if (!/^\d+$/.test(raw)) throw new InvalidQueryError();
+  const n = Number(raw);
+  if (n < 1 || n > max) throw new InvalidQueryError();
+  return n;
+}
+
 async function readJson(req: IncomingMessage): Promise<unknown> {
   const raw = await readCappedBody(req, 1024 * 1024);
   return raw.length ? JSON.parse(raw.toString("utf8")) : {};
@@ -101,7 +113,7 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
         const bindings = await listBindings(deps.db, {
           ...(url.searchParams.get("workspaceId") ? { workspaceId: url.searchParams.get("workspaceId")! } : {}),
           ...(url.searchParams.get("provider") ? { provider: url.searchParams.get("provider")! } : {}),
-          limit: Number(url.searchParams.get("limit") ?? 100),
+          limit: limitParam(url),
         });
         json(res, 200, { bindings });
         return true;
@@ -120,7 +132,7 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
         const rows = await listArchive(deps.db, {
           ...(url.searchParams.get("lane") ? { lane: url.searchParams.get("lane")! } : {}),
           ...(url.searchParams.get("provider") ? { provider: url.searchParams.get("provider")! } : {}),
-          limit: Number(url.searchParams.get("limit") ?? 100),
+          limit: limitParam(url),
         });
         json(res, 200, { rows });
         return true;
@@ -130,7 +142,9 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
         if (!parsed.success || (!parsed.data.ids?.length && !parsed.data.lane && !parsed.data.provider)) {
           return json(res, 400, { error: "invalid_request" }), true;
         }
-        const ids = await replayArchive(deps.db, parsed.data, "admin");
+        // Explicit ids are replayed in full: the limit defaults to their count.
+        const selector = parsed.data.ids?.length && parsed.data.limit === undefined ? { ...parsed.data, limit: parsed.data.ids.length } : parsed.data;
+        const ids = await replayArchive(deps.db, selector, "admin");
         deps.logger.event("dlq_replay", { area: "admin", count: ids.length });
         json(res, 200, { replayed: ids.length, ids });
         return true;
@@ -171,6 +185,8 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
     if (error instanceof InvalidWorkspaceIdError) return json(res, 400, { error: "invalid_workspace_id" }), true;
     if (error instanceof BodyTooLargeError) return json(res, 413, { error: "payload_too_large" }), true;
     if (error instanceof SyntaxError) return json(res, 400, { error: "invalid_json" }), true;
+    if (error instanceof InvalidQueryError) return json(res, 400, { error: "invalid_request" }), true;
+    deps.logger.event("admin_error", { area: "admin", route, errorName: error instanceof Error ? error.name : typeof error });
     json(res, 503, { error: "storage_unavailable" });
     return true;
   }

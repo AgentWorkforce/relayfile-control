@@ -47,14 +47,14 @@ export async function newPglite(): Promise<Db> {
 }
 
 /** Real Postgres for opt-in concurrency tests: a fresh schema per call. */
-export async function newRealPg(url: string, max = 30): Promise<{ db: Db; drop: () => Promise<void> }> {
+export async function newRealPg(url: string, max = 30, opts: { migrate?: boolean } = {}): Promise<{ db: Db; drop: () => Promise<void> }> {
   const schema = `t_${randomBytes(6).toString("hex")}`;
   const admin = pgDb(url, { max: 1 });
   await admin.exec(`CREATE SCHEMA ${schema}`);
   await admin.close();
   const sep = url.includes("?") ? "&" : "?";
   const db = pgDb(`${url}${sep}options=${encodeURIComponent(`-c search_path=${schema}`)}`, { max });
-  await migrate(db);
+  if (opts.migrate !== false) await migrate(db);
   return {
     db,
     drop: async () => {

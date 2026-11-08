@@ -1,9 +1,18 @@
 type Labels = Record<string, string | number>;
 
+/** Label values are short machine codes; anything else (e.g. an odd Relayfile reason) collapses to "other". */
+function labelValue(v: string | number): string {
+  const s = String(v);
+  return /^[A-Za-z0-9_.:\-]{1,64}$/.test(s) ? s : "other";
+}
+
 function labelKey(labels: Labels): string {
   const keys = Object.keys(labels).sort();
-  return keys.map((k) => `${k}="${String(labels[k]).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n")}"`).join(",");
+  return keys.map((k) => `${k}="${labelValue(labels[k]!)}"`).join(",");
 }
+
+/** Hard bound on series per metric name, so no label source can grow memory without limit. */
+const MAX_SERIES_PER_METRIC = 500;
 
 const BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60];
 
@@ -17,16 +26,26 @@ export class Metrics {
   private histograms = new Map<string, Map<string, { buckets: number[]; sum: number; count: number }>>();
   readonly prefix = "relayfile_control_";
 
+  private admit(series: Map<string, unknown>, key: string): boolean {
+    if (series.has(key) || series.size < MAX_SERIES_PER_METRIC) return true;
+    this.droppedSeries += 1;
+    return false;
+  }
+  private droppedSeries = 0;
+
   inc(name: string, labels: Labels = {}, by = 1): void {
     const series = this.counters.get(name) ?? new Map<string, number>();
     const key = labelKey(labels);
+    if (!this.admit(series, key)) return;
     series.set(key, (series.get(key) ?? 0) + by);
     this.counters.set(name, series);
   }
 
   set(name: string, value: number, labels: Labels = {}): void {
     const series = this.gauges.get(name) ?? new Map<string, number>();
-    series.set(labelKey(labels), value);
+    const key = labelKey(labels);
+    if (!this.admit(series, key)) return;
+    series.set(key, value);
     this.gauges.set(name, series);
   }
 
@@ -40,6 +59,7 @@ export class Metrics {
   observe(name: string, seconds: number, labels: Labels = {}): void {
     const series = this.histograms.get(name) ?? new Map();
     const key = labelKey(labels);
+    if (!this.admit(series, key)) return;
     const h = series.get(key) ?? { buckets: BUCKETS.map(() => 0), sum: 0, count: 0 };
     BUCKETS.forEach((b, i) => {
       if (seconds <= b) h.buckets[i] = (h.buckets[i] ?? 0) + 1;
@@ -56,7 +76,7 @@ export class Metrics {
 
   /** Sum of a counter across all label sets matching `match`. */
   counterSum(name: string, match: Labels = {}): number {
-    const want = Object.entries(match).map(([k, v]) => `${k}="${v}"`);
+    const want = Object.entries(match).map(([k, v]) => `${k}="${labelValue(v)}"`);
     let total = 0;
     for (const [key, value] of this.counters.get(name) ?? []) {
       if (want.every((w) => key.split(",").includes(w))) total += value;
@@ -91,6 +111,7 @@ export class Metrics {
         lines.push(`${this.prefix}${name}_count${key ? `{${key}}` : ""} ${h.count}`);
       }
     }
+    lines.push(`# TYPE ${this.prefix}metric_series_dropped_total counter`, `${this.prefix}metric_series_dropped_total ${this.droppedSeries}`);
     return lines.join("\n") + "\n";
   }
 }

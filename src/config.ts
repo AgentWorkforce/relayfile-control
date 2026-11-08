@@ -2,13 +2,18 @@ import { z } from "zod";
 
 const MiB = 1024 * 1024;
 
+/** An empty env value means "unset" (use the default), never 0/false. */
+const blankToUndefined = (v: unknown) => (typeof v === "string" && v.trim() === "" ? undefined : v);
 const int = (def: number, min: number, max: number) =>
-  z.coerce.number().int().min(min).max(max).default(def);
+  z.preprocess(blankToUndefined, z.coerce.number().int().min(min).max(max).default(def));
 const bool = (def: boolean) =>
-  z
-    .enum(["1", "0", "true", "false", "yes", "no", "on", "off", ""])
-    .default(def ? "true" : "false")
-    .transform((v) => ["1", "true", "yes", "on"].includes(v));
+  z.preprocess(
+    blankToUndefined,
+    z
+      .enum(["1", "0", "true", "false", "yes", "no", "on", "off"])
+      .default(def ? "true" : "false")
+      .transform((v) => ["1", "true", "yes", "on"].includes(v)),
+  );
 /** Comma/whitespace separated secret list (rotation). Empty means "not configured". */
 const secrets = z
   .string()
@@ -29,6 +34,8 @@ export const ConfigSchema = z.object({
   ADMIN_LISTEN: z.string().default("127.0.0.1:3101"),
   DATABASE_URL: optional,
   DATABASE_POOL_MAX: int(20, 1, 500),
+  /** Server-side statement_timeout for every pooled connection (bounds hung sweeps and blob reads). */
+  DATABASE_STATEMENT_TIMEOUT_MS: int(30_000, 1000, 3_600_000),
   MIGRATE_ON_START: bool(false),
 
   // §2.2 secrets (lists allow rotation).
@@ -145,7 +152,9 @@ export function redactedConfig(config: Config): Record<string, unknown> {
 export function parseListen(value: string): { host: string; port: number } {
   const idx = value.lastIndexOf(":");
   const host = idx > 0 ? value.slice(0, idx) : "0.0.0.0";
-  const port = Number(idx >= 0 ? value.slice(idx + 1) : value);
-  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`invalid listen address ${value}`);
+  const portText = idx >= 0 ? value.slice(idx + 1) : value;
+  if (!/^\d{1,5}$/.test(portText)) throw new Error(`invalid listen address ${value}`);
+  const port = Number(portText);
+  if (port < 1 || port > 65535) throw new Error(`invalid listen address ${value}`);
   return { host, port };
 }

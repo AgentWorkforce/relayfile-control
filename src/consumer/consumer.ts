@@ -7,7 +7,7 @@ import { laneHash, type Logger } from "../observability/log.ts";
 import type { Metrics } from "../observability/metrics.ts";
 import { backpressureCooldownSeconds, type CooldownStore } from "../queue/cooldown.ts";
 import { resolveForwardRetryDelaySeconds } from "../queue/retry-delay.ts";
-import { claimNext, fanOut, heartbeat, markDead, markDone, markRetry } from "../queue/store.ts";
+import { claimNext, fanOut, heartbeat, markDead, markDone, markRetry, relaneAndRequeue } from "../queue/store.ts";
 import { type RelayfileBackpressureError, RelayfileServerError } from "../relayfile/backpressure.ts";
 import { type RelayfileClient, RelayfileUnexpectedStatusError, TerminalHandlerError } from "../relayfile/client.ts";
 import { type EnvelopeHandler, forwardEnvelope, RetryableHandlerError } from "./envelope-handler.ts";
@@ -35,7 +35,14 @@ export type ConsumerDeps = {
   deadlineMs?: (provider: string) => number;
 };
 
-export type Disposition = "ack" | "ack_terminal" | "retry" | "dead" | "fanout" | "lease_lost";
+export type Disposition = "ack" | "ack_terminal" | "retry" | "dead" | "fanout" | "relane" | "lease_lost";
+
+export class LeaseLostError extends Error {
+  constructor() {
+    super("lease_lost");
+    this.name = "LeaseLostError";
+  }
+}
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -89,13 +96,14 @@ export class Consumer {
       worker,
       leaseSeconds: this.deps.config.LEASE_SECONDS,
       perLaneMax: this.deps.config.PER_LANE_MAX_INFLIGHT,
+      cooldownEnabled: this.deps.config.COOLDOWN_ENABLED,
     });
     if (!row) return false;
     await this.process(row, worker);
     return true;
   }
 
-  /** Drain until no claimable work remains (tests / e2e). */
+  /** Drain until no claimable work remains (tests / e2e). A relaned row is requeued and claimed again. */
   async drain(maxRows = 100_000): Promise<number> {
     let n = 0;
     while (n < maxRows && (await this.runOnce())) n += 1;
@@ -107,8 +115,17 @@ export class Consumer {
     const started = Date.now();
     const deadline = (this.deps.deadlineMs ?? handlerDeadlineMs)(row.provider);
     const abort = new AbortController();
+    let leaseLost = false;
     const beat = setInterval(() => {
-      void heartbeat(this.deps.db, row.id, worker, config.LEASE_SECONDS).catch(() => undefined);
+      void heartbeat(this.deps.db, row.id, worker, config.LEASE_SECONDS)
+        .then((held) => {
+          // Another worker may now own this row: stop delivering a second copy.
+          if (!held && !leaseLost) {
+            leaseLost = true;
+            abort.abort(new LeaseLostError());
+          }
+        })
+        .catch(() => undefined);
     }, Math.max(1000, Math.floor((config.LEASE_SECONDS * 1000) / 3)));
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
@@ -133,7 +150,11 @@ export class Consumer {
         }),
         timeout,
       ]);
-      if (outcome.type === "fanout") {
+      if (outcome.type === "relane") {
+        const ok = await relaneAndRequeue(this.deps.db, row.id, worker, outcome.workspaceId, { disposition: "relane", reason: outcome.reason });
+        disposition = ok ? "relane" : "lease_lost";
+        fields = { reason: outcome.reason };
+      } else if (outcome.type === "fanout") {
         const children = await fanOut(this.deps.db, row, worker, outcome.workspaceIds, { disposition: "ack", reason: outcome.reason });
         disposition = "fanout";
         fields = { reason: outcome.reason, children: children.length };
@@ -143,7 +164,12 @@ export class Consumer {
         disposition = ok ? "ack" : "lease_lost";
       }
     } catch (error) {
-      ({ disposition, fields } = await this.onError(row, worker, error));
+      if (leaseLost) {
+        disposition = "lease_lost";
+        fields = { code: "lease_lost" };
+      } else {
+        ({ disposition, fields } = await this.onError(row, worker, error));
+      }
     } finally {
       clearTimeout(timer);
       clearInterval(beat);

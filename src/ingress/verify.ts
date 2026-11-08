@@ -86,7 +86,9 @@ export function splitHookdeckSecrets(secrets: readonly string[]): { standard: st
 function standardKey(secret: string): Buffer | null {
   const encoded = secret.slice(STANDARD_PREFIX.length);
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) return null;
-  return Buffer.from(encoded, "base64");
+  const key = Buffer.from(encoded, "base64");
+  // An empty (or trivially short) key would make the HMAC computable by anyone.
+  return key.length >= 16 ? key : null;
 }
 
 /** Standard Webhooks: `v1,<base64 HMAC(key, "${id}.${ts}.${body}")>`, ±300 s, space-separated rotation list. */

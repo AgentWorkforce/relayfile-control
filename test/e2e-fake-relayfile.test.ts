@@ -48,101 +48,105 @@ async function runStorm(flavour: "oss" | "cloud", cooldown: boolean) {
   const consumer = new Consumer({ db: t.db, config, logger: t.logger, metrics: t.app.metrics, entitlement: t.entitlement, cooldowns: t.app.cooldowns, relayfile });
   const sweeper = new Sweeper({ db: t.db, config, logger: t.logger, metrics: t.app.metrics, cooldowns: t.app.cooldowns, depth: t.app.depth });
 
-  const delivery = (conn: string, i: number) => {
-    const body = JSON.stringify({ type: "forward", from: "notion", connectionId: conn, payload: { id: `${conn}-page-${i}`, object: "page" } });
-    return { body, headers: { ...sign.nango(body), "x-nango-delivery-id": `${conn}-${i}` } };
-  };
+  try {
+    const delivery = (conn: string, i: number) => {
+      const body = JSON.stringify({ type: "forward", from: "notion", connectionId: conn, payload: { id: `${conn}-page-${i}`, object: "page" } });
+      return { body, headers: { ...sign.nango(body), "x-nango-delivery-id": `${conn}-${i}` } };
+    };
 
-  // Phase 1: the storm workspace floods; the calm one keeps sending.
-  const ingress: { conn: string; i: number; status: number; reason?: string }[] = [];
-  for (let i = 0; i < 60; i += 1) {
-    for (const conn of ["conn-storm", ...(i < 20 ? ["conn-calm"] : [])]) {
-      const d = delivery(conn, i);
-      const r = await t.post("/api/v1/webhooks/nango", d.body, d.headers);
-      ingress.push({ conn, i, status: r.status, ...(r.json?.reason ? { reason: r.json.reason } : {}) });
-    }
-  }
-
-  consumer.start();
-  let calmDoneAt: number | null = null;
-  let cooldownSeenArmed = false;
-  const warp = async (seconds: number) => {
-    simulated += seconds;
-    await t.db.query("UPDATE webhook_envelopes SET visible_at = visible_at - make_interval(secs => $1) WHERE state = 'queued'", [seconds]);
-    await t.db.query("UPDATE lane_cooldowns SET until = until - make_interval(secs => $1)", [seconds]);
-  };
-  const counts = async () =>
-    (await t.db.query<{ lane: string; state: string; n: number }>("SELECT lane, state, count(*)::int AS n FROM webhook_envelopes GROUP BY lane, state")).rows;
-
-  for (let step = 0; step < 200; step += 1) {
-    await new Promise((r) => setTimeout(r, 60));
-    if ((await t.app.cooldowns.list()).length > 0) cooldownSeenArmed = true;
-    await sweeper.fast();
-    await sweeper.slow();
-    const c = await counts();
-    const calmOpen = c.filter((r) => r.lane === "rw_calm" && r.state !== "done").reduce((a, r) => a + r.n, 0);
-    const calmTotal = c.filter((r) => r.lane === "rw_calm").reduce((a, r) => a + r.n, 0);
-    if (calmDoneAt === null && calmTotal > 0 && calmOpen === 0) calmDoneAt = simulated;
-    // Providers keep redelivering what ingress refused with 429 (with their own backoff);
-    // here once per simulated step after the storm, until each one is accepted.
-    if (simulated >= STORM_SECONDS + 60) {
-      for (const r of ingress.filter((x) => x.status === 429)) {
-        const d = delivery(r.conn, r.i);
-        r.status = (await t.post("/api/v1/webhooks/nango", d.body, d.headers)).status;
+    // Phase 1: the storm workspace floods; the calm one keeps sending.
+    const ingress: { conn: string; i: number; status: number; reason?: string }[] = [];
+    for (let i = 0; i < 60; i += 1) {
+      for (const conn of ["conn-storm", ...(i < 20 ? ["conn-calm"] : [])]) {
+        const d = delivery(conn, i);
+        const r = await t.post("/api/v1/webhooks/nango", d.body, d.headers);
+        ingress.push({ conn, i, status: r.status, ...(r.json?.reason ? { reason: r.json.reason } : {}) });
       }
-      const after = await counts();
-      const open = after.filter((r) => r.state !== "done").reduce((a, r) => a + r.n, 0);
-      if (ingress.every((x) => x.status !== 429) && open === 0) break;
     }
-    await warp(STEP_SECONDS);
-  }
-  await consumer.stop();
-  await sweeper.slow();
 
-  const finalCounts = await counts();
-  const dead = finalCounts.filter((r) => r.state === "dead").reduce((a, r) => a + r.n, 0);
-  const archived = (await t.db.query<{ n: number }>("SELECT count(*)::int AS n FROM webhook_dlq_archive")).rows[0]!.n;
-  const done = await t.db.query<{ workspace_id: string; delivery_id: string; last_outcome: any }>(
-    "SELECT workspace_id, delivery_id, last_outcome FROM webhook_envelopes WHERE state = 'done'",
-  );
-  const unwrittenAcks = done.rows.filter((r) => !fake.stored.has(JSON.stringify([r.workspace_id, "notion", r.delivery_id])));
-  const outcomes = t.logger.named("consume_outcome");
-  const bpOutcomes = outcomes.filter((o) => o.code === "relayfile_backpressure");
-  const ingressRejected = t.logger.named("ingress_rejected");
-  const accepted202 = ingress.filter((x) => x.status === 202).length;
-  const report = {
-    flavour,
-    cooldownEnabled: cooldown,
-    simulatedSeconds: simulated,
-    stormSeconds: STORM_SECONDS,
-    ingress: {
-      sent: ingress.length,
-      refused429: ingressRejected.filter((e) => e.status === 429).length,
-      refusedReasons: [...new Set(ingressRejected.map((e) => e.reason))],
-      finalAccepted: accepted202,
-    },
-    calmLaneDrainedAtSimulatedSeconds: calmDoneAt,
-    consumeOutcomes: outcomes.length,
-    backpressureOutcomes: bpOutcomes.length,
-    backpressureOutcomesWithReason: bpOutcomes.filter((o) => typeof o.relayfileReason === "string").length,
-    cooldownArmedEvents: t.logger.named("cooldown_armed").length,
-    cooldownSkipEvents: t.logger.named("forward_cooldown_skip").length,
-    cooldownSeenArmed,
-    cooldownLanesAtEnd: (await t.app.cooldowns.list()).length,
-    relayfileRequests: fake.requests.length,
-    relayfileStored: fake.stored.size,
-    relayfileRejectedSignatures: fake.rejected.length,
-    unwrittenAcks: unwrittenAcks.length,
-    dead,
-    dlqArchived: archived,
-    finalStates: finalCounts,
-  };
-  const name = `${flavour}-cooldown-${cooldown ? "on" : "off"}`;
-  const file = path.join(process.env.TMPDIR ?? ".", `e2e-storm-report-${name}.md`);
-  await writeFile(file, `# e2e storm report (${name})\n\n\`\`\`json\n${JSON.stringify(report, null, 2)}\n\`\`\`\n`);
-  await t.close();
-  await fake.close();
-  return { report, file, ingress };
+    consumer.start();
+    let calmDoneAt: number | null = null;
+    let cooldownSeenArmed = false;
+    const warp = async (seconds: number) => {
+      simulated += seconds;
+      await t.db.query("UPDATE webhook_envelopes SET visible_at = visible_at - make_interval(secs => $1) WHERE state = 'queued'", [seconds]);
+      await t.db.query("UPDATE lane_cooldowns SET until = until - make_interval(secs => $1)", [seconds]);
+    };
+    const counts = async () =>
+      (await t.db.query<{ lane: string; state: string; n: number }>("SELECT lane, state, count(*)::int AS n FROM webhook_envelopes GROUP BY lane, state")).rows;
+
+    for (let step = 0; step < 200; step += 1) {
+      await new Promise((r) => setTimeout(r, 60));
+      if ((await t.app.cooldowns.list()).length > 0) cooldownSeenArmed = true;
+      await sweeper.fast();
+      await sweeper.slow();
+      const c = await counts();
+      const calmOpen = c.filter((r) => r.lane === "rw_calm" && r.state !== "done").reduce((a, r) => a + r.n, 0);
+      const calmTotal = c.filter((r) => r.lane === "rw_calm").reduce((a, r) => a + r.n, 0);
+      if (calmDoneAt === null && calmTotal > 0 && calmOpen === 0) calmDoneAt = simulated;
+      // Providers keep redelivering what ingress refused with 429 (with their own backoff);
+      // here once per simulated step after the storm, until each one is accepted.
+      if (simulated >= STORM_SECONDS + 60) {
+        for (const r of ingress.filter((x) => x.status === 429)) {
+          const d = delivery(r.conn, r.i);
+          r.status = (await t.post("/api/v1/webhooks/nango", d.body, d.headers)).status;
+        }
+        const after = await counts();
+        const open = after.filter((r) => r.state !== "done").reduce((a, r) => a + r.n, 0);
+        if (ingress.every((x) => x.status !== 429) && open === 0) break;
+      }
+      await warp(STEP_SECONDS);
+    }
+    await consumer.stop();
+    await sweeper.slow();
+
+    const finalCounts = await counts();
+    const dead = finalCounts.filter((r) => r.state === "dead").reduce((a, r) => a + r.n, 0);
+    const archived = (await t.db.query<{ n: number }>("SELECT count(*)::int AS n FROM webhook_dlq_archive")).rows[0]!.n;
+    const done = await t.db.query<{ workspace_id: string; delivery_id: string; last_outcome: any }>(
+      "SELECT workspace_id, delivery_id, last_outcome FROM webhook_envelopes WHERE state = 'done'",
+    );
+    const unwrittenAcks = done.rows.filter((r) => !fake.stored.has(JSON.stringify([r.workspace_id, "notion", r.delivery_id])));
+    const outcomes = t.logger.named("consume_outcome");
+    const bpOutcomes = outcomes.filter((o) => o.code === "relayfile_backpressure");
+    const ingressRejected = t.logger.named("ingress_rejected");
+    const accepted202 = ingress.filter((x) => x.status === 202).length;
+    const report = {
+      flavour,
+      cooldownEnabled: cooldown,
+      simulatedSeconds: simulated,
+      stormSeconds: STORM_SECONDS,
+      ingress: {
+        sent: ingress.length,
+        refused429: ingressRejected.filter((e) => e.status === 429).length,
+        refusedReasons: [...new Set(ingressRejected.map((e) => e.reason))],
+        finalAccepted: accepted202,
+      },
+      calmLaneDrainedAtSimulatedSeconds: calmDoneAt,
+      consumeOutcomes: outcomes.length,
+      backpressureOutcomes: bpOutcomes.length,
+      backpressureOutcomesWithReason: bpOutcomes.filter((o) => typeof o.relayfileReason === "string").length,
+      cooldownArmedEvents: t.logger.named("cooldown_armed").length,
+      cooldownSkipEvents: t.logger.named("forward_cooldown_skip").length,
+      cooldownSeenArmed,
+      cooldownLanesAtEnd: (await t.app.cooldowns.list()).length,
+      relayfileRequests: fake.requests.length,
+      relayfileStored: fake.stored.size,
+      relayfileRejectedSignatures: fake.rejected.length,
+      unwrittenAcks: unwrittenAcks.length,
+      dead,
+      dlqArchived: archived,
+      finalStates: finalCounts,
+    };
+    const name = `${flavour}-cooldown-${cooldown ? "on" : "off"}`;
+    const file = path.join(process.env.TMPDIR ?? ".", `e2e-storm-report-${name}.md`);
+    await writeFile(file, `# e2e storm report (${name})\n\n\`\`\`json\n${JSON.stringify(report, null, 2)}\n\`\`\`\n`);
+    return { report, file, ingress };
+  } finally {
+    await consumer.stop();
+    await t.close();
+    await fake.close();
+  }
 }
 
 for (const flavour of ["oss", "cloud"] as const) {

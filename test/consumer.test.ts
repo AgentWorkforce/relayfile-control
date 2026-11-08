@@ -28,7 +28,8 @@ async function setup(respond?: (n: number) => FakeResponse, cfg: Partial<Record<
   return { db, fake, config, logger, metrics, entitlement, cooldowns, consumer, close: async () => { await fake.close(); await db.close(); } };
 }
 
-const ghRow = (over = {}) => envelope("unresolved:github:1", { nativeIds: { installation_id: "1" }, providerDeliveryId: `github:${Math.random()}`, headers: { "x-github-event": "issues" }, eventType: "issues.opened", ...over });
+// Lane resolved at ingress (the binding cache), as for a known installation; the fan-out test passes an unresolved lane.
+const ghRow = (over: Record<string, unknown> = {}) => envelope("rw_a", { nativeIds: { installation_id: "1" }, providerDeliveryId: `github:${Math.random()}`, headers: { "x-github-event": "issues" }, eventType: "issues.opened", ...over });
 
 async function only<T>(db: Db, sql: string): Promise<T> {
   return (await db.query<T>(sql)).rows[0]!;
@@ -217,7 +218,7 @@ describe("consumer → fake Relayfile (§4.4, §6)", () => {
   it("GitHub installation fan-out: one child per workspace, each delivered once", async () => {
     const s = await setup();
     await upsertBinding(s.db, { workspaceId: "rw_b", provider: "github", connectionId: "gh-b", nativeIds: { installation_id: "1" } });
-    await insertEnvelope(s.db, ghRow());
+    await insertEnvelope(s.db, ghRow({ lane: "unresolved:github:1", workspaceId: null }));
     await s.consumer.drain();
     assert.deepEqual(s.fake.requests.map((r) => r.workspaceId).sort(), ["rw_a", "rw_b"]);
     const ids = new Set(s.fake.requests.map((r) => r.body.envelopeId));

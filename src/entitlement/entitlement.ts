@@ -1,5 +1,24 @@
 import { createPublicKey, verify, type KeyObject } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { open } from "node:fs/promises";
+
+/** Read at most `max` bytes of a response body; null when it is larger. */
+async function readBounded(response: Response, max: number): Promise<string | null> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
 
 /**
  * §11 entitlement: relayfile is a licence add-on. Two sources, OR-ed:
@@ -134,9 +153,11 @@ export class RefreshingEntitlement implements Entitlement {
 
   private async checkRemote(): Promise<{ ok: boolean; reason: string } | null> {
     if (!this.opts.relaycontrolBaseUrl) return null;
+    // An unauthenticated capability answer is not trusted.
+    if (!this.opts.serviceToken) return { ok: false, reason: "relaycontrol_service_token_missing" };
     try {
       const response = await this.fetchImpl(new URL("/api/v1/license", this.opts.relaycontrolBaseUrl), {
-        headers: this.opts.serviceToken ? { authorization: `Bearer ${this.opts.serviceToken}` } : {},
+        headers: { authorization: `Bearer ${this.opts.serviceToken}` },
         redirect: "manual",
         signal: AbortSignal.timeout(10_000),
       });
@@ -144,8 +165,8 @@ export class RefreshingEntitlement implements Entitlement {
         await response.body?.cancel().catch(() => undefined);
         return { ok: false, reason: `relaycontrol_status_${response.status}` };
       }
-      const text = await response.text();
-      if (text.length > 64 * 1024) return { ok: false, reason: "relaycontrol_response_too_large" };
+      const text = await readBounded(response, 64 * 1024);
+      if (text === null) return { ok: false, reason: "relaycontrol_response_too_large" };
       const body = JSON.parse(text) as { capabilities?: { relayfile?: unknown } };
       return body.capabilities?.relayfile === true ? { ok: true, reason: "relaycontrol_capability" } : { ok: false, reason: "relaycontrol_not_entitled" };
     } catch {
@@ -157,7 +178,15 @@ export class RefreshingEntitlement implements Entitlement {
     let doc = this.opts.licenseDocument;
     if (!doc && this.opts.licenseFile) {
       try {
-        doc = await readFile(this.opts.licenseFile, "utf8");
+        const handle = await open(this.opts.licenseFile, "r");
+        try {
+          const buf = Buffer.alloc(MAX_DOCUMENT_BYTES + 1);
+          const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+          if (bytesRead > MAX_DOCUMENT_BYTES) return { ok: false, reason: "license_too_large" };
+          doc = buf.subarray(0, bytesRead).toString("utf8");
+        } finally {
+          await handle.close();
+        }
       } catch {
         return { ok: false, reason: "license_file_unreadable" };
       }
@@ -184,9 +213,12 @@ export class RefreshingEntitlement implements Entitlement {
       return this.status();
     }
     const reason = [remote?.reason, document?.reason].filter(Boolean).join(",") || "no_entitlement_source_configured";
-    // A definitive "not entitled" answer ends grace; only unavailability is covered.
-    const definitive = remote?.reason === "relaycontrol_not_entitled" || document?.reason === "license_expired" || document?.reason === "license_missing_feature";
-    const inGrace = !definitive && this.lastGoodMs !== null && nowMs - this.lastGoodMs <= this.opts.graceSeconds * 1000;
+    // A definitive "not entitled" answer (or a tampered/invalid licence) ends grace for good:
+    // the last good result is forgotten, so a later outage cannot re-entitle. Only unavailability is covered.
+    const DEFINITIVE = new Set(["relaycontrol_not_entitled", "license_expired", "license_missing_feature", "license_bad_signature", "license_malformed", "license_too_large"]);
+    const definitive = DEFINITIVE.has(remote?.reason ?? "") || DEFINITIVE.has(document?.reason ?? "");
+    if (definitive) this.lastGoodMs = null;
+    const inGrace = this.lastGoodMs !== null && nowMs - this.lastGoodMs <= this.opts.graceSeconds * 1000;
     this.state = {
       entitled: inGrace,
       source: inGrace ? "grace" : null,

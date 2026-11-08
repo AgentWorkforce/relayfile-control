@@ -6,13 +6,15 @@ import { dedupeKey, relayfileEnvelopeId, type EnvelopeRow } from "../envelope/mo
 import { laneHash, type Logger } from "../observability/log.ts";
 import type { Metrics } from "../observability/metrics.ts";
 import { claim, completeClaim, failClaim } from "../queue/claims.ts";
-import { readPayload, relane } from "../queue/store.ts";
+import { readPayload } from "../queue/store.ts";
 import { type RelayfileClient, TerminalHandlerError, type WebhookEnvelopeBody } from "../relayfile/client.ts";
 import { envelopePolicy } from "./policy.ts";
 
 export type HandlerOutcome =
   | { type: "ack"; reason: string; relayfileStatus?: number; relayfileOutcome?: string; relayfileMs?: number; payloadReadMs?: number }
-  | { type: "fanout"; workspaceIds: string[]; reason: string };
+  | { type: "fanout"; workspaceIds: string[]; reason: string }
+  /** Resolved to a different lane: move and requeue so the destination lane's cap and cool-down apply. */
+  | { type: "relane"; workspaceId: string; reason: string };
 
 /** A retryable condition that is not a Relayfile error (e.g. a pending binding). */
 export class RetryableHandlerError extends Error {
@@ -103,9 +105,12 @@ export const forwardEnvelope: EnvelopeHandler = async (row, ctx) => {
 
   let workspaceId = row.workspace_id;
   let binding: Binding | undefined;
-  const resolution = await resolveBindings(ctx.db, { connectionId: row.connection_id, nativeIds: row.native_ids });
+  const resolution = await resolveBindings(ctx.db, { provider: row.provider, connectionId: row.connection_id, nativeIds: row.native_ids });
   if (workspaceId) {
     binding = resolution.kind === "matched" ? resolution.bindings.find((b) => b.workspace_id === workspaceId) : undefined;
+    // A pinned workspace whose binding was disabled or removed must not fall back to the
+    // global Relayfile URL: retry (and eventually preserve in the DLQ) instead.
+    if (!binding) throw new RetryableHandlerError("binding_missing_for_workspace");
   } else {
     if (resolution.kind === "pending") throw new RetryableHandlerError("binding_pending");
     if (resolution.kind === "unmatched") return { type: "ack", reason: "unmatched_workspace" };
@@ -117,10 +122,12 @@ export const forwardEnvelope: EnvelopeHandler = async (row, ctx) => {
       ctx.logger.event("ambiguous_binding", { area: "consumer", requestId: row.request_id, provider: row.provider, candidates: workspaces.length });
       ctx.metrics.inc("ambiguous_binding_total", { provider: providerFamily(row.provider) });
     }
-    workspaceId = workspaces[0] ?? null;
-    if (!workspaceId) return { type: "ack", reason: "unmatched_workspace" };
+    // §5 HARD: a Nango forward takes the first match (logged above as ambiguous_binding).
+    const first = workspaces[0];
+    if (!first) return { type: "ack", reason: "unmatched_workspace" };
+    if (row.lane !== first) return { type: "relane", workspaceId: first, reason: `resolved_${resolution.via}` };
+    workspaceId = first;
     binding = resolution.bindings.find((b) => b.workspace_id === workspaceId);
-    if (!(await relane(ctx.db, row.id, ctx.worker, workspaceId, workspaceId))) throw new RetryableHandlerError("lease_lost");
   }
 
   const baseUrl = baseUrlFor(binding, ctx.config);
@@ -128,12 +135,16 @@ export const forwardEnvelope: EnvelopeHandler = async (row, ctx) => {
 
   const claimSurface = row.kind === "nango-forward" ? "nango-forward" : null;
   const claimId = claimSurface ? dedupeKey([row.request_id, workspaceId]) : null;
+  let claimAttempt = 0;
   if (claimSurface && claimId) {
     const claimed = await claim(ctx.db, { surface: claimSurface, dedupeId: claimId, leaseSeconds: ctx.config.CLAIM_LEASE_SECONDS, envelopeId: row.id });
     if (!claimed.claimed) {
+      // Still in flight under another live lease: that holder may crash mid-delivery, so retry, never ack.
+      if (claimed.inFlight) throw new RetryableHandlerError("claim_in_flight");
       ctx.metrics.inc("claims_duplicates_total", { surface: claimSurface });
       return { type: "ack", reason: "duplicate" };
     }
+    claimAttempt = claimed.attempts;
   }
 
   try {
@@ -166,7 +177,7 @@ export const forwardEnvelope: EnvelopeHandler = async (row, ctx) => {
     } finally {
       ctx.metrics.observe("relayfile_request_seconds", (Date.now() - started) / 1000, { surface: "webhook-envelopes" });
     }
-    if (claimSurface && claimId) await completeClaim(ctx.db, claimSurface, claimId);
+    if (claimSurface && claimId) await completeClaim(ctx.db, claimSurface, claimId, claimAttempt);
     return {
       type: "ack",
       reason: result.outcome === "duplicate" ? "relayfile_duplicate_envelope" : `relayfile_${result.outcome}`,
@@ -176,7 +187,7 @@ export const forwardEnvelope: EnvelopeHandler = async (row, ctx) => {
       payloadReadMs,
     };
   } catch (error) {
-    if (claimSurface && claimId) await failClaim(ctx.db, claimSurface, claimId).catch(() => undefined);
+    if (claimSurface && claimId) await failClaim(ctx.db, claimSurface, claimId, claimAttempt).catch(() => undefined);
     if (error instanceof TerminalHandlerError && error.code === "relayfile_payload_too_large") {
       // ingress accepts github up to 25 MiB; OSS caps the whole envelope at 1 MiB (layered-control ask).
       ctx.metrics.inc("relayfile_envelope_too_large_total", { provider: providerFamily(row.provider), ingress: row.ingress });

@@ -3,14 +3,21 @@ import type { Queryable } from "../db/db.ts";
 /**
  * §3 level 2: handler claims, one implementation for every surface.
  *
- * Claim = the plan's atomic upsert. `lease_until` is cleared on completion,
- * so the plan's `lease_until < now()` predicate can only ever reclaim a
- * crashed `processing` row, never a `completed` one.
+ * Claim = the plan's atomic upsert, with the expired-lease branch narrowed to
+ * `processing` rows so the §3 HARD invariant (completed → duplicate) holds
+ * whatever `lease_until` a completed row carries. `lease_until` is also
+ * cleared on completion.
  *
  * With `coalesceSeconds` (Google-mail forward sync), a `completed` row older
  * than the window may be reclaimed; younger is a duplicate (Cloud behaviour).
  */
-export type ClaimResult = { claimed: true; attempts: number } | { claimed: false };
+/**
+ * `claimed: false` distinguishes a finished delivery (`inFlight: false`: a true
+ * duplicate, ack it) from one still in flight under a live lease (`inFlight:
+ * true`: the holder may crash mid-delivery, so retry, never ack).
+ * `attempts` is the fencing token for complete/fail.
+ */
+export type ClaimResult = { claimed: true; attempts: number } | { claimed: false; inFlight: boolean };
 
 export async function claim(
   db: Queryable,
@@ -23,7 +30,7 @@ export async function claim(
      ON CONFLICT (surface, dedupe_id) DO UPDATE
         SET status = 'processing', lease_until = now() + make_interval(secs => $3),
             envelope_id = EXCLUDED.envelope_id, attempts = claims.attempts + 1, completed_at = NULL
-      WHERE claims.status = 'failed' OR claims.lease_until < now()
+      WHERE claims.status = 'failed' OR (claims.status = 'processing' AND claims.lease_until < now())
          ${coalesce ? "OR (claims.status = 'completed' AND claims.completed_at < now() - make_interval(secs => $5))" : ""}
      RETURNING attempts`,
     coalesce
@@ -31,21 +38,33 @@ export async function claim(
       : [input.surface, input.dedupeId, input.leaseSeconds, input.envelopeId ?? null],
   );
   const row = rows[0];
-  return row ? { claimed: true, attempts: row.attempts } : { claimed: false };
+  if (row) return { claimed: true, attempts: row.attempts };
+  const existing = await db.query<{ status: string }>("SELECT status FROM webhook_delivery_claims WHERE surface = $1 AND dedupe_id = $2", [
+    input.surface,
+    input.dedupeId,
+  ]);
+  return { claimed: false, inFlight: existing.rows[0]?.status === "processing" };
 }
 
-/** Handler success. */
-export async function completeClaim(db: Queryable, surface: string, dedupeId: string): Promise<void> {
-  await db.query(
-    "UPDATE webhook_delivery_claims SET status = 'completed', lease_until = NULL, completed_at = now() WHERE surface = $1 AND dedupe_id = $2",
-    [surface, dedupeId],
+/**
+ * Handler success, fenced on the claim attempt: a late handler whose lease
+ * expired and was reclaimed cannot complete the newer claim. False when fenced out.
+ */
+export async function completeClaim(db: Queryable, surface: string, dedupeId: string, attempts: number): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE webhook_delivery_claims SET status = 'completed', lease_until = NULL, completed_at = now()
+      WHERE surface = $1 AND dedupe_id = $2 AND status = 'processing' AND attempts = $3`,
+    [surface, dedupeId, attempts],
   );
+  return r.rowCount > 0;
 }
 
-/** Handler failure: release so the next attempt can reclaim. */
-export async function failClaim(db: Queryable, surface: string, dedupeId: string): Promise<void> {
-  await db.query(
-    "UPDATE webhook_delivery_claims SET status = 'failed', lease_until = NULL WHERE surface = $1 AND dedupe_id = $2 AND status = 'processing'",
-    [surface, dedupeId],
+/** Handler failure: release so the next attempt can reclaim. Fenced like `completeClaim`. */
+export async function failClaim(db: Queryable, surface: string, dedupeId: string, attempts: number): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE webhook_delivery_claims SET status = 'failed', lease_until = NULL
+      WHERE surface = $1 AND dedupe_id = $2 AND status = 'processing' AND attempts = $3`,
+    [surface, dedupeId, attempts],
   );
+  return r.rowCount > 0;
 }

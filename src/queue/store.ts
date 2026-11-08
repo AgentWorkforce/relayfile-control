@@ -38,7 +38,8 @@ export function ingressDedupeSurface(ingress: Ingress): string {
 export async function insertEnvelope(db: Db, input: NewEnvelope): Promise<InsertResult> {
   const id = ulid(input.receivedAt.getTime());
   const sha = sha256Hex(input.raw);
-  const inline = input.raw.length <= input.inlineMaxBytes;
+  // jsonb cannot hold \u0000; such (validly signed) payloads go to the bytea blob path instead of failing ingest.
+  const inline = input.raw.length <= input.inlineMaxBytes && !input.raw.includes("\\u0000");
   const deliveryId = input.providerDeliveryId ?? input.requestId;
   const surface = input.providerDeliveryId ? ingressDedupeSurface(input.ingress) : null;
   const dedupeId = input.providerDeliveryId ? dedupeKey([input.provider, input.providerDeliveryId]) : null;
@@ -125,10 +126,16 @@ export class QueueDepth {
     this.globalCache = null;
   }
 
-  async oldestAgeSeconds(): Promise<number> {
-    const { rows } = await this.db.query<{ age: number | null }>(
-      "SELECT EXTRACT(EPOCH FROM (now() - min(visible_at)))::float8 AS age FROM webhook_envelopes WHERE state = 'queued' AND visible_at <= now()",
-    );
+  /** Age of the oldest visible queued row, for one lane (admission) or overall (metrics). */
+  async oldestAgeSeconds(lane?: string): Promise<number> {
+    const { rows } = lane
+      ? await this.db.query<{ age: number | null }>(
+          "SELECT EXTRACT(EPOCH FROM (now() - min(visible_at)))::float8 AS age FROM webhook_envelopes WHERE state = 'queued' AND lane = $1 AND visible_at <= now()",
+          [lane],
+        )
+      : await this.db.query<{ age: number | null }>(
+          "SELECT EXTRACT(EPOCH FROM (now() - min(visible_at)))::float8 AS age FROM webhook_envelopes WHERE state = 'queued' AND visible_at <= now()",
+        );
     return Math.max(0, Number(rows[0]?.age ?? 0));
   }
 
@@ -147,6 +154,8 @@ export type ClaimOptions = {
   worker: string;
   leaseSeconds: number;
   perLaneMax: number;
+  /** COOLDOWN_ENABLED. When false, rows armed earlier no longer block claiming. Default true. */
+  cooldownEnabled?: boolean;
   /** How many candidate lanes to try before giving up this round. */
   maxLaneTries?: number;
 };
@@ -165,14 +174,14 @@ export async function claimNext(db: Db, opts: ClaimOptions): Promise<EnvelopeRow
       const pick = await q.query<{ id: string; lane: string }>(
         `SELECT id, lane FROM webhook_envelopes
           WHERE state = 'queued' AND visible_at <= now()
-            AND lane NOT IN (SELECT lane FROM lane_cooldowns WHERE until > now())
+            AND ($3::boolean IS FALSE OR lane NOT IN (SELECT lane FROM lane_cooldowns WHERE until > now()))
             AND lane NOT IN (SELECT lane FROM webhook_envelopes
                               WHERE state = 'leased' GROUP BY lane
                              HAVING count(*) >= $1)
             AND NOT (lane = ANY($2::text[]))
           ORDER BY visible_at, received_at
           FOR UPDATE SKIP LOCKED LIMIT 1`,
-        [opts.perLaneMax, skip],
+        [opts.perLaneMax, skip, opts.cooldownEnabled ?? true],
       );
       const candidate = pick.rows[0];
       if (!candidate) return null;
@@ -256,6 +265,23 @@ export async function relane(db: Queryable, id: string, worker: string, workspac
     `UPDATE webhook_envelopes SET workspace_id = $3, lane = $4, updated_at = now()
       WHERE id = $1 AND leased_by = $2 AND state = 'leased'`,
     [id, worker, workspaceId, lane],
+  );
+  return r.rowCount > 0;
+}
+
+/**
+ * Move a leased row to its resolved workspace lane and put it straight back
+ * in the queue (visible now, the attempt refunded). The next claim then goes
+ * through the destination lane's per-lane cap and cool-down, which the claim
+ * on the unresolved lane never checked.
+ */
+export async function relaneAndRequeue(db: Queryable, id: string, worker: string, workspaceId: string, outcome: Record<string, unknown>): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE webhook_envelopes
+        SET workspace_id = $3, lane = $3, state = 'queued', leased_by = NULL, lease_until = NULL,
+            attempts = GREATEST(attempts - 1, 0), visible_at = now(), updated_at = now(), ${APPEND_OUTCOME.replace(/\$3/g, "$4")}
+      WHERE id = $1 AND leased_by = $2 AND state = 'leased'`,
+    [id, worker, workspaceId, JSON.stringify(outcome)],
   );
   return r.rowCount > 0;
 }

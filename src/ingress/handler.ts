@@ -147,7 +147,7 @@ async function admission(deps: IngressDeps, lane: string): Promise<Reply | null>
   const total = await deps.depth.global();
   if (total >= config.GLOBAL_MAX_QUEUED) return refuse("global_queue_full", total);
   const cooled = await deps.cooldowns.remaining(lane);
-  if (cooled > 0 && (await deps.depth.oldestAgeSeconds()) >= config.MAX_QUEUE_AGE_SECONDS) {
+  if (cooled > 0 && (await deps.depth.oldestAgeSeconds(lane)) >= config.MAX_QUEUE_AGE_SECONDS) {
     return refuse("lane_stale_cooldown", laneQueued, Math.max(retryAfter, cooled));
   }
   return null;
@@ -164,7 +164,9 @@ export async function handleWebhook(req: IncomingMessage, res: ServerResponse, i
       logged = { ...logged, ...fields };
     });
   } catch (error) {
-    void error;
+    // Logged by name only (never the message: it may echo input). Storage errors are the expected case;
+    // anything else is still answered retryably so a provider redelivers rather than loses the event.
+    logged = { ...logged, errorName: error instanceof Error ? error.name : typeof error, storage: error instanceof StorageError };
     reply = reject(503, "storage_unavailable");
   }
   const status = reply.status;
@@ -257,7 +259,7 @@ async function processWebhook(
         return reject(404, "unknown_installation");
       }
     }
-    lane = (await deps.bindings.lane(classified.connectionId, classified.nativeIds)) ??
+    lane = (await deps.bindings.lane(classified.provider, classified.connectionId, classified.nativeIds)) ??
       unresolvedLane(classified.provider, classified.connectionId, classified.nativeIds);
     note({ laneHash: laneHash(lane), provider: classified.provider, kind: classified.kind });
     const refused = await admission(deps, lane);

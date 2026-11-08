@@ -59,9 +59,16 @@ export function createApp(deps: AppDeps): App {
     try {
       await deps.db.query("SELECT 1");
       db = true;
-      migrations = await migrationStatus(deps.db, deps.migrationsDir);
     } catch {
       db = false;
+    }
+    let migrationError: string | undefined;
+    if (db) {
+      try {
+        migrations = await migrationStatus(deps.db, deps.migrationsDir);
+      } catch (error) {
+        migrationError = error instanceof Error ? error.name : "unknown";
+      }
     }
     let paused = deps.config.INGRESS_PAUSED;
     try {
@@ -74,7 +81,7 @@ export function createApp(deps: AppDeps): App {
     json(res, ready ? 200 : 503, {
       ready,
       db,
-      migration: migrations,
+      migration: migrationError ? { ...migrations, error: migrationError } : migrations,
       entitlement: deps.entitlement.status(),
       ingressPaused: paused,
       role: deps.config.ROLE,

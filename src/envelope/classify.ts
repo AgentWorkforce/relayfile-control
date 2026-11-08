@@ -157,7 +157,10 @@ function eventTypeFrom(ingress: Ingress, provider: string, headers: Headers, inn
     const action = str(inner.action);
     if (type) return action ? `${type}.${action}` : type;
   }
-  if (ingress === "hookdeck") return header(headers, "x-gitlab-event") ?? null;
+  if (ingress === "hookdeck") {
+    const gitlab = header(headers, "x-gitlab-event");
+    if (gitlab) return gitlab;
+  }
   return str(inner.type) ?? null;
 }
 

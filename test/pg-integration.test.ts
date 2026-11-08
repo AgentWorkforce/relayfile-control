@@ -59,9 +59,11 @@ async function waitFor(cond: () => Promise<boolean>, timeoutMs: number): Promise
 
 describe("real Postgres: claims and queue under concurrency", opts, () => {
   it("concurrent migrators do not race (advisory lock)", async () => {
-    const { db, drop } = await newRealPg(URL!);
+    const { db, drop } = await newRealPg(URL!, 30, { migrate: false });
     const results = await Promise.all([migrate(db), migrate(db), migrate(db)]);
-    assert.deepEqual(results.flat(), [], "already migrated by newRealPg; concurrent re-runs are no-ops");
+    assert.deepEqual(results.flat(), ["0001"], "each pending version applied exactly once across the three migrators");
+    const { rows } = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM schema_migrations");
+    assert.equal(rows[0]!.n, 1);
     await drop();
   });
 
@@ -120,8 +122,9 @@ describe("real Postgres: claims and queue under concurrency", opts, () => {
     };
     const consumers = [consumerWith(db, handler, { CONSUMER_CONCURRENCY: "10" }), consumerWith(db, handler, { CONSUMER_CONCURRENCY: "10" })];
     consumers.forEach((c) => c.start());
-    await waitFor(async () => (await db.query<{ n: number }>("SELECT count(*)::int AS n FROM webhook_envelopes WHERE state <> 'done'")).rows[0]!.n === 0, 30_000);
+    const drained = await waitFor(async () => (await db.query<{ n: number }>("SELECT count(*)::int AS n FROM webhook_envelopes WHERE state <> 'done'")).rows[0]!.n === 0, 30_000);
     await Promise.all(consumers.map((c) => c.stop()));
+    assert.ok(drained, "lane drained");
     assert.ok(maxInflight <= 2, `in-flight per lane ${maxInflight} > 2`);
     assert.ok(maxDbLeased <= 2, `leased per lane ${maxDbLeased} > 2`);
     assert.equal(maxInflight, 2, "the cap is actually used");

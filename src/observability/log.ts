@@ -6,15 +6,25 @@ export interface Logger {
   event(event: string, fields?: LogFields): void;
 }
 
-/** Field names that must never appear in a log line (§10: never payloads, never secrets). */
-const FORBIDDEN = new Set(["payload", "body", "rawBody", "secret", "authorization", "signature", "token"]);
+/** Field names that must never appear in a log line (§10: never payloads, never secrets). Case-insensitive. */
+const FORBIDDEN = /^(payload|body|rawbody|headers|secret|.*secret.*|authorization|cookie|signature|.*token.*|password)$/i;
 
-function scrub(fields: LogFields): LogFields {
+function scrubValue(value: unknown, depth: number): unknown {
+  if (Array.isArray(value)) return depth > 4 ? "[truncated]" : value.map((v) => scrubValue(v, depth + 1));
+  if (value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
+    if (depth > 4) return "[truncated]";
+    return scrub(value as LogFields, depth + 1);
+  }
+  return value;
+}
+
+function scrub(fields: LogFields, depth = 0): LogFields {
   const out: LogFields = {};
   for (const [key, value] of Object.entries(fields)) {
-    if (FORBIDDEN.has(key)) continue;
     if (value === undefined) continue;
-    out[key] = value;
+    // Redacted config values are already "set"/"unset" strings; any other value under a secret-like key is dropped.
+    if (FORBIDDEN.test(key) && !(value === "set" || value === "unset")) continue;
+    out[key] = scrubValue(value, depth);
   }
   return out;
 }

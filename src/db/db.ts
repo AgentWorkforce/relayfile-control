@@ -20,8 +20,12 @@ export interface Db extends Queryable {
   close(): Promise<void>;
 }
 
-export function pgDb(connectionString: string, options: { max?: number } = {}): Db {
-  const pool = new pg.Pool({ connectionString, max: options.max ?? 20 });
+export function pgDb(connectionString: string, options: { max?: number; statementTimeoutMs?: number } = {}): Db {
+  const pool = new pg.Pool({
+    connectionString,
+    max: options.max ?? 20,
+    ...(options.statementTimeoutMs ? { statement_timeout: options.statementTimeoutMs } : {}),
+  });
   // An idle client error (e.g. the server restarted) must not crash the process.
   pool.on("error", () => undefined);
   return {
@@ -31,6 +35,7 @@ export function pgDb(connectionString: string, options: { max?: number } = {}): 
     },
     async tx<T>(fn: (q: Tx) => Promise<T>): Promise<T> {
       const client = await pool.connect();
+      let broken = false;
       try {
         await client.query("BEGIN");
         const q: Tx = {
@@ -46,10 +51,12 @@ export function pgDb(connectionString: string, options: { max?: number } = {}): 
         await client.query("COMMIT");
         return value;
       } catch (error) {
-        await client.query("ROLLBACK").catch(() => undefined);
+        // A connection whose ROLLBACK failed may still be inside a transaction:
+        // destroy it rather than return it to the pool.
+        broken = await client.query("ROLLBACK").then(() => false, () => true);
         throw error;
       } finally {
-        client.release();
+        client.release(broken);
       }
     },
     async exec(sql: string) {

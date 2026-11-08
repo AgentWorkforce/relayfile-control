@@ -113,6 +113,7 @@ paths:
   /api/v1/admin/bindings:
     post:
       summary: Upsert an integration binding (workspaceId must start with rw_)
+      description: Keyed by (provider, connectionId). Omitted optional fields keep their stored values; an explicit null clears them.
       security: [{ admin: [] }]
       requestBody:
         required: true

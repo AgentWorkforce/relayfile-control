@@ -1,6 +1,16 @@
 import type { Queryable } from "../db/db.ts";
 import type { NativeIds } from "../envelope/model.ts";
 import { ulid } from "../envelope/ulid.ts";
+import { providerFamily } from "../envelope/classify.ts";
+
+/** Emails are matched case-insensitively (classify lower-cases the envelope side). */
+function normalizeNativeIds(ids: NativeIds | undefined): NativeIds | undefined {
+  if (!ids) return ids;
+  return ids.email ? { ...ids, email: ids.email.toLowerCase() } : ids;
+}
+
+/** SQL predicate: the binding's provider family (prefix before `-`) equals $n. */
+const FAMILY_SQL = (n: number) => `split_part(lower(provider), '-', 1) = $${n}`;
 
 export type Binding = {
   id: string;
@@ -35,14 +45,21 @@ export function assertWorkspaceId(id: unknown): asserts id is string {
   if (typeof id !== "string" || !/^rw_[A-Za-z0-9_-]{1,128}$/.test(id)) throw new InvalidWorkspaceIdError();
 }
 
+/**
+ * Upsert by (provider, connectionId). Omitted optional fields (undefined) keep
+ * their stored values; an explicit null clears them.
+ */
 export async function upsertBinding(db: Queryable, input: BindingInput): Promise<Binding> {
   assertWorkspaceId(input.workspaceId);
+  const nativeIds = normalizeNativeIds(input.nativeIds);
   const { rows } = await db.query<Binding>(
     `INSERT INTO integration_bindings (id, workspace_id, provider, connection_id, provider_config_key, native_ids, relayfile_base_url, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     VALUES ($1, $2, $3, $4, $5, COALESCE($6::jsonb, '{}'::jsonb), $7, $8)
      ON CONFLICT (provider, connection_id) DO UPDATE
-        SET workspace_id = EXCLUDED.workspace_id, provider_config_key = EXCLUDED.provider_config_key,
-            native_ids = EXCLUDED.native_ids, relayfile_base_url = EXCLUDED.relayfile_base_url,
+        SET workspace_id = EXCLUDED.workspace_id,
+            provider_config_key = CASE WHEN $9::boolean THEN EXCLUDED.provider_config_key ELSE integration_bindings.provider_config_key END,
+            native_ids = CASE WHEN $10::boolean THEN EXCLUDED.native_ids ELSE integration_bindings.native_ids END,
+            relayfile_base_url = CASE WHEN $11::boolean THEN EXCLUDED.relayfile_base_url ELSE integration_bindings.relayfile_base_url END,
             status = EXCLUDED.status, updated_at = now()
      RETURNING *`,
     [
@@ -51,9 +68,12 @@ export async function upsertBinding(db: Queryable, input: BindingInput): Promise
       input.provider,
       input.connectionId,
       input.providerConfigKey ?? null,
-      JSON.stringify(input.nativeIds ?? {}),
+      nativeIds === undefined ? null : JSON.stringify(nativeIds),
       input.relayfileBaseUrl ?? null,
       input.status ?? "active",
+      input.providerConfigKey !== undefined,
+      input.nativeIds !== undefined,
+      input.relayfileBaseUrl !== undefined,
     ],
   );
   return rows[0]!;
@@ -97,23 +117,26 @@ const NATIVE_KEYS: (keyof NativeIds)[] = ["installation_id", "team_id", "enterpr
  */
 export async function resolveBindings(
   db: Queryable,
-  input: { connectionId: string | null; nativeIds: NativeIds },
+  input: { provider: string; connectionId: string | null; nativeIds: NativeIds },
 ): Promise<Resolution> {
+  // Scoped to the provider family: a connection or native id reused by another provider never routes here.
+  const family = providerFamily(input.provider);
   if (input.connectionId) {
     const { rows } = await db.query<Binding>(
-      "SELECT * FROM integration_bindings WHERE connection_id = $1 AND status <> 'disabled' ORDER BY created_at",
-      [input.connectionId],
+      `SELECT * FROM integration_bindings WHERE connection_id = $1 AND ${FAMILY_SQL(2)} AND status <> 'disabled' ORDER BY created_at`,
+      [input.connectionId, family],
     );
     const active = rows.filter((b) => b.status === "active");
     if (active.length > 0) return { kind: "matched", bindings: active, via: "connection" };
     if (rows.some((b) => b.status === "pending")) return { kind: "pending" };
   }
+  const nativeIds = normalizeNativeIds(input.nativeIds) ?? {};
   for (const key of NATIVE_KEYS) {
-    const value = input.nativeIds[key];
+    const value = nativeIds[key];
     if (!value) continue;
     const { rows } = await db.query<Binding>(
-      "SELECT * FROM integration_bindings WHERE native_ids @> $1::jsonb AND status = 'active' ORDER BY created_at",
-      [JSON.stringify({ [key]: value })],
+      `SELECT * FROM integration_bindings WHERE native_ids @> $1::jsonb AND ${FAMILY_SQL(2)} AND status = 'active' ORDER BY created_at`,
+      [JSON.stringify({ [key]: value }), family],
     );
     if (rows.length > 0) return { kind: "matched", bindings: rows, via: "native" };
   }
@@ -130,11 +153,11 @@ export class BindingLaneCache {
   ) {}
 
   /** The single workspace lane, or null when unresolved/ambiguous (the consumer decides). */
-  async lane(connectionId: string | null, nativeIds: NativeIds): Promise<string | null> {
-    const key = JSON.stringify([connectionId, nativeIds]);
+  async lane(provider: string, connectionId: string | null, nativeIds: NativeIds): Promise<string | null> {
+    const key = JSON.stringify([providerFamily(provider), connectionId, nativeIds]);
     const hit = this.cache.get(key);
     if (hit && Date.now() - hit.at < this.ttlMs) return hit.lane;
-    const r = await resolveBindings(this.db, { connectionId, nativeIds });
+    const r = await resolveBindings(this.db, { provider, connectionId, nativeIds });
     const workspaces = r.kind === "matched" ? [...new Set(r.bindings.map((b) => b.workspace_id))] : [];
     const lane = workspaces.length === 1 ? (workspaces[0] ?? null) : null;
     if (this.cache.size >= this.max) this.cache.clear();
@@ -144,7 +167,7 @@ export class BindingLaneCache {
 
   /** Whether a GitHub installation is known at all (§5 unknown-installation rule). */
   async knownInstallation(installationId: string): Promise<boolean> {
-    const r = await resolveBindings(this.db, { connectionId: null, nativeIds: { installation_id: installationId } });
+    const r = await resolveBindings(this.db, { provider: "github", connectionId: null, nativeIds: { installation_id: installationId } });
     return r.kind === "matched";
   }
 
