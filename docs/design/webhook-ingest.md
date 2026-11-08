@@ -607,10 +607,27 @@ runbook. Each PR is a draft until Khaliq un-drafts; Khaliq merges.
    (§11).
 2. ANSWERED (Khaliq, 2026-11-08): integration-watch agent dispatch lives in
    Relayfile. relayfile-control ingests and writes only.
-3. (layered-relayfile) Confirm the envelope `payload` shape for non-GitHub
-   providers is free-form on both flavours. Also: envelope-only path uses
-   `path=""` and `providerEventType=eventType=<provider event header or "">`
-   in the envelopeId hash; confirm OSS dedupe agrees.
+3. ANSWERED (layered-relayfile, 2026-11-08): the envelope `payload` is NOT
+   free-form on either flavour. Both accept (202) any JSON object, but a
+   file is materialised only for the filesystem-event shape. Contract for
+   every provider on both flavours, top level of `payload`:
+   `{event_type: file.created|file.updated|file.deleted, path, content,
+   contentType?, providerEventType?, resourceRef?}`. Never put provider
+   raw objects under `payload.data` (cloud reads `content` from `data`,
+   OSS from the top level); use `raw` or omit them. OSS: other event types
+   are ignored (202, no file, no retry); missing path is a parse error
+   (retried then dead-lettered); Slack paths under channels/ dms/ teams/
+   users/; coalesce key providerObjectId → objectId → path. Cloud: unknown
+   event type WITH a path throws (retry then DLQ), no path is silently
+   ignored; cloud-only extras `provider_event_type`, `resource_ref`,
+   `resource_refs` are honoured there and ignored by OSS.
+   Dedupe key is `(workspaceId, provider, deliveryId)`, NOT envelopeId:
+   retries MUST keep deliveryId stable (§6.1). Headers are a string→string
+   map. OSS 413 is on the whole envelope body (RELAYFILE_MAX_BODY_BYTES,
+   default 1 MiB), terminal. OSS 500 (generic store error, no Retry-After)
+   gets the same bounded retry as 503. The path-less envelopeId derivation
+   (`path=""`, event header as both event types) is still awaiting its
+   one-line confirmation.
 4. (helm lane) Chart home: standalone `relayfile-control` or sub-chart of the
    relayfile add-on.
 5. (relaycontrol, me) Service token for `/api/v1/license` and the licence
