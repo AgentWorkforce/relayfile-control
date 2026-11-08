@@ -1,0 +1,40 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rfc
+          POSTGRES_PASSWORD: rfc-ci-only
+          POSTGRES_DB: rfc_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U rfc" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      RELAYFILE_CONTROL_PG_TEST_URL: postgres://rfc:rfc-ci-only@127.0.0.1:5432/rfc_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      - name: e2e storm reports
+        if: always()
+        run: cat "$RUNNER_TEMP"/e2e-storm-report-*.md 2>/dev/null || cat /tmp/e2e-storm-report-*.md 2>/dev/null || true
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t relayfile-control:ci .
