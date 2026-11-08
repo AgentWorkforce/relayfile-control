@@ -3,6 +3,12 @@ import type { NativeIds } from "../envelope/model.ts";
 import { ulid } from "../envelope/ulid.ts";
 import { providerFamily } from "../envelope/classify.ts";
 
+/** Finite integer LIMIT in [1, 1000] whatever the caller passed. */
+function safeLimit(v: number | undefined, def = 100): number {
+  const n = typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : def;
+  return Math.min(Math.max(n, 1), 1000);
+}
+
 /** Emails are matched case-insensitively (classify lower-cases the envelope side). */
 function normalizeNativeIds(ids: NativeIds | undefined): NativeIds | undefined {
   if (!ids) return ids;
@@ -94,7 +100,7 @@ export async function listBindings(db: Queryable, filter: { workspaceId?: string
     `SELECT * FROM integration_bindings
       WHERE ($1::text IS NULL OR workspace_id = $1) AND ($2::text IS NULL OR provider = $2)
       ORDER BY created_at DESC LIMIT $3`,
-    [filter.workspaceId ?? null, filter.provider ?? null, Math.min(Math.max(filter.limit ?? 100, 1), 1000)],
+    [filter.workspaceId ?? null, filter.provider ?? null, safeLimit(filter.limit)],
   );
   return rows;
 }

@@ -1,5 +1,11 @@
 import type { Db, Queryable } from "../db/db.ts";
 
+/** Finite integer LIMIT in [1, 1000] whatever the caller passed. */
+function safeLimit(v: number | undefined, def = 100): number {
+  const n = typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : def;
+  return Math.min(Math.max(n, 1), 1000);
+}
+
 /** §8 preservation delay: min(300, 60·2^min(cycle,3)) seconds. */
 export function preservationDelaySeconds(cycle: number): number {
   return Math.min(300, 60 * 2 ** Math.min(Math.max(0, cycle), 3));
@@ -95,7 +101,7 @@ export async function listArchive(
        FROM webhook_dlq_archive
       WHERE ($1::text IS NULL OR lane = $1) AND ($2::text IS NULL OR provider = $2)
       ORDER BY archived_at DESC LIMIT $3`,
-    [filter.lane ?? null, filter.provider ?? null, Math.min(Math.max(filter.limit ?? 100, 1), 1000)],
+    [filter.lane ?? null, filter.provider ?? null, safeLimit(filter.limit)],
   );
   return rows;
 }
