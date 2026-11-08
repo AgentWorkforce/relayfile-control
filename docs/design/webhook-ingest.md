@@ -533,11 +533,18 @@ entitled to `relayfile`:
   outage does not stop ingest.
 - Not entitled: ingress returns `403 {"error":"feature_not_licensed"}` and the
   consumer pauses (rows stay queued); `/readyz` says why.
-- Capability `provider_writes`: on only when `RELAYFILE_FLAVOR=cloud`
-  (relayfile-cloud); for `oss` the service posts envelopes only and the
-  record-writer stage is skipped with reason `provider_writes_unsupported`
-  (logged once per lane per hour). Whether OSS Relayfile gains the
-  provider-writes route is Khaliq's decision (open question, §14).
+- Capability `provider_writes`: decided 2026-11-08 (Khaliq): OSS Relayfile
+  gets a provider-writes route too (a relayfile PR, coordinated with
+  layered-relayfile), so self-host reaches canonical-record parity. The
+  capability is therefore NOT flavour-gated. It is on when the installation
+  sets `RELAYFILE_PROVIDER_WRITES=true` (the Relayfile target serves
+  `POST /api/v1/workspaces/{ws}/provider-writes`); until the OSS route lands
+  the OSS default is `false` and the record-writer stage is skipped with
+  reason `provider_writes_unsupported` (logged once per lane per hour).
+  `RELAYFILE_FLAVOR` stays only to select response-code nuances (§6.2).
+- `/readyz` stays 200 and reports entitlement in its body; only database or
+  migration failure makes the pod unready (otherwise the 403 is never seen
+  behind a load balancer).
 
 ## 12. Deployment shapes and migration from Cloud
 
@@ -593,16 +600,45 @@ runbook. Each PR is a draft until Khaliq un-drafts; Khaliq merges.
 
 ## 14. Open questions
 
-1. (Khaliq) Does OSS Relayfile get a provider-writes route? Until then
-   self-host on OSS is envelope-only (§11).
-2. (Khaliq) Is the integration-watch agent dispatch part of this service or
-   Relayfile's? This plan assumes Relayfile.
+1. ANSWERED (Khaliq, 2026-11-08 via relay-desktop-7): YES, OSS Relayfile gets
+   a provider-writes route; self-host reaches canonical-record parity, not
+   envelope-only. The route is an OSS relayfile PR coordinated with
+   layered-relayfile; relayfile-control gates on `RELAYFILE_PROVIDER_WRITES`
+   (§11).
+2. ANSWERED (Khaliq, 2026-11-08): integration-watch agent dispatch lives in
+   Relayfile. relayfile-control ingests and writes only.
 3. (layered-relayfile) Confirm the envelope `payload` shape for non-GitHub
-   providers is free-form on both flavours.
+   providers is free-form on both flavours. Also: envelope-only path uses
+   `path=""` and `providerEventType=eventType=<provider event header or "">`
+   in the envelopeId hash; confirm OSS dedupe agrees.
 4. (helm lane) Chart home: standalone `relayfile-control` or sub-chart of the
    relayfile add-on.
 5. (relaycontrol, me) Service token for `/api/v1/license` and the licence
-   public key env name; I will add both to relaycontrol if missing.
+   public key env name: `RELAYCONTROL_SERVICE_TOKEN` and
+   `RELAYCONTROL_LICENSE_PUBLIC_KEY` (PEM or base64 raw 32 bytes); the
+   relaycontrol side is not implemented yet.
+
+### 14.1 Implementation rulings (PR 1, 2026-11-08)
+
+- 413: streamed cap, returned as soon as the cap is crossed, before any
+  signature check (the HMAC needs the whole body); nothing past the cap is
+  buffered.
+- §4.2 per-lane cap is made strict with `pg_try_advisory_xact_lock(
+  hashtextextended(lane, 0))` plus a re-check inside the claim transaction;
+  a real-Postgres race test covers it.
+- §6.4 queue depth: per-lane counter rows maintained by trigger; the global
+  total is their sum, cached 1 s in-process; oldest age from the
+  `(state, visible_at)` index.
+- GitHub installation fan-out: the consumer splits a parent envelope into one
+  child envelope per workspace (own lane, parent request id as correlation)
+  and acks the parent in the same transaction.
+- Hookdeck verification follows Cloud's exact order: Dropbox signature first,
+  then Hookdeck signature (skipped for gitlab/bitbucket/granola/shortcut),
+  then Nango signature required; raw providers without handlers fail closed
+  (401) in PR 1.
+- PR 1 also carries `integration_bindings`, the minimal admin API (bindings
+  upsert/list, DLQ list/replay, ingress pause) and the generic claims module.
+- Commits by the implementer carry its own model trailer (Opus 5.5).
 
 ## 15. Source map (Cloud @ 1a59dec unless noted)
 
