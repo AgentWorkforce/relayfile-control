@@ -1,0 +1,277 @@
+openapi: 3.1.0
+info:
+  title: relayfile-control
+  version: 0.1.0
+  description: |
+    Integration webhook ingest for Relayfile (docs/design/webhook-ingest.md on
+    branch design/webhook-ingest). Public listener: webhook ingress, /healthz,
+    /readyz. Internal listener (ADMIN_LISTEN): /metrics and /api/v1/admin/*.
+    Every webhook response carries `x-relayfile-control-request-id`.
+    `/cloud/api/v1/webhooks/*` aliases every webhook route.
+servers:
+  - url: https://relayfile-control.example.invalid
+paths:
+  /api/v1/webhooks/github:
+    post:
+      summary: GitHub App webhook (x-hub-signature-256)
+      parameters:
+        - { in: header, name: x-hub-signature-256, required: true, schema: { type: string, pattern: "^sha256=[a-fA-F0-9]{64}$" } }
+        - { in: header, name: x-github-delivery, schema: { type: string } }
+        - { in: header, name: x-github-event, schema: { type: string } }
+      requestBody: { $ref: "#/components/requestBodies/Raw25MiB" }
+      responses:
+        "202": { $ref: "#/components/responses/Ingress202" }
+        "200": { $ref: "#/components/responses/Ingress200" }
+        "400": { $ref: "#/components/responses/Ingress400" }
+        "401": { $ref: "#/components/responses/Ingress401" }
+        "403": { $ref: "#/components/responses/Ingress403" }
+        "404": { $ref: "#/components/responses/Ingress404" }
+        "413": { $ref: "#/components/responses/Ingress413" }
+        "429": { $ref: "#/components/responses/Ingress429" }
+        "503": { $ref: "#/components/responses/Ingress503" }
+  /api/v1/webhooks/nango:
+    post:
+      summary: Nango forward / sync / auth events (x-nango-hmac-sha256 or legacy x-nango-signature)
+      requestBody: { $ref: "#/components/requestBodies/Raw1MiB" }
+      responses:
+        "202": { $ref: "#/components/responses/Ingress202" }
+        "200": { $ref: "#/components/responses/Ingress200" }
+        "400": { $ref: "#/components/responses/Ingress400" }
+        "401": { $ref: "#/components/responses/Ingress401" }
+        "403": { $ref: "#/components/responses/Ingress403" }
+        "404": { $ref: "#/components/responses/Ingress404" }
+        "413": { $ref: "#/components/responses/Ingress413" }
+        "429": { $ref: "#/components/responses/Ingress429" }
+        "503": { $ref: "#/components/responses/Ingress503" }
+  /api/v1/webhooks/hookdeck:
+    get:
+      summary: Dropbox-style challenge echo
+      parameters:
+        - { in: query, name: challenge, schema: { type: string } }
+      responses:
+        "200": { description: "The challenge, echoed, text/plain", content: { text/plain: { schema: { type: string } } } }
+        "405": { description: "No challenge; `Allow: POST`" }
+    post:
+      summary: Hookdeck delivery
+      description: |
+        Cloud's order: x-dropbox-signature (HMAC with DROPBOX_APP_SECRET) first;
+        else a Standard Webhooks or legacy Hookdeck signature (skipped for detected
+        gitlab/bitbucket/granola/shortcut); then the Nango signature is required.
+      requestBody: { $ref: "#/components/requestBodies/Raw1MiB" }
+      responses:
+        "202": { $ref: "#/components/responses/Ingress202" }
+        "200": { $ref: "#/components/responses/Ingress200" }
+        "400": { $ref: "#/components/responses/Ingress400" }
+        "401": { $ref: "#/components/responses/Ingress401" }
+        "403": { $ref: "#/components/responses/Ingress403" }
+        "404": { $ref: "#/components/responses/Ingress404" }
+        "413": { $ref: "#/components/responses/Ingress413" }
+        "429": { $ref: "#/components/responses/Ingress429" }
+        "503": { $ref: "#/components/responses/Ingress503" }
+  /api/v1/webhooks/slack:
+    post:
+      summary: Slack Events API (x-slack-signature v0, ±300 s); url_verification answered 200 {challenge}
+      requestBody: { $ref: "#/components/requestBodies/Raw1MiB" }
+      responses:
+        "202": { $ref: "#/components/responses/Ingress202" }
+        "200": { $ref: "#/components/responses/Ingress200" }
+        "400": { $ref: "#/components/responses/Ingress400" }
+        "401": { $ref: "#/components/responses/Ingress401" }
+        "403": { $ref: "#/components/responses/Ingress403" }
+        "404": { $ref: "#/components/responses/Ingress404" }
+        "413": { $ref: "#/components/responses/Ingress413" }
+        "429": { $ref: "#/components/responses/Ingress429" }
+        "503": { $ref: "#/components/responses/Ingress503" }
+  /api/v1/webhooks/linear:
+    post:
+      summary: Linear webhook (linear-signature HMAC hex; body webhookTimestamp ±60 s)
+      requestBody: { $ref: "#/components/requestBodies/Raw1MiB" }
+      responses:
+        "202": { $ref: "#/components/responses/Ingress202" }
+        "200": { $ref: "#/components/responses/Ingress200" }
+        "400": { $ref: "#/components/responses/Ingress400" }
+        "401": { $ref: "#/components/responses/Ingress401" }
+        "403": { $ref: "#/components/responses/Ingress403" }
+        "404": { $ref: "#/components/responses/Ingress404" }
+        "413": { $ref: "#/components/responses/Ingress413" }
+        "429": { $ref: "#/components/responses/Ingress429" }
+        "503": { $ref: "#/components/responses/Ingress503" }
+  /healthz:
+    get:
+      summary: Liveness
+      responses: { "200": { description: "ok" } }
+  /readyz:
+    get:
+      summary: Readiness. 503 only on database or migration failure; entitlement and pause are reported.
+      responses:
+        "200": { description: "Ready", content: { application/json: { schema: { $ref: "#/components/schemas/Readiness" } } } }
+        "503": { description: "Not ready", content: { application/json: { schema: { $ref: "#/components/schemas/Readiness" } } } }
+  /metrics:
+    get:
+      summary: Prometheus text (internal listener only)
+      responses: { "200": { description: "metrics", content: { text/plain: { schema: { type: string } } } } }
+  /api/v1/admin/bindings:
+    post:
+      summary: Upsert an integration binding (workspaceId must start with rw_)
+      description: Keyed by (provider, connectionId). Omitted optional fields keep their stored values; an explicit null clears them.
+      security: [{ admin: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/BindingInput" } } }
+      responses:
+        "200": { description: "Upserted" }
+        "400": { description: "invalid_request | invalid_workspace_id" }
+        "401": { description: "unauthorized" }
+    get:
+      summary: List bindings
+      security: [{ admin: [] }]
+      parameters:
+        - { in: query, name: workspaceId, schema: { type: string } }
+        - { in: query, name: provider, schema: { type: string } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 1000 } }
+      responses: { "200": { description: "Bindings" } }
+    delete:
+      summary: Delete a binding
+      security: [{ admin: [] }]
+      parameters:
+        - { in: query, name: provider, required: true, schema: { type: string } }
+        - { in: query, name: connectionId, required: true, schema: { type: string } }
+      responses: { "200": { description: "Deleted" }, "404": { description: "Not found" } }
+  /api/v1/admin/dlq:
+    get:
+      summary: List DLQ archive rows (also POST /api/v1/admin/dlq/list)
+      security: [{ admin: [] }]
+      parameters:
+        - { in: query, name: lane, schema: { type: string } }
+        - { in: query, name: provider, schema: { type: string } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 1000 } }
+      responses: { "200": { description: "Rows with last outcome and full outcome history" } }
+  /api/v1/admin/dlq/replay:
+    post:
+      summary: Re-queue archived rows with attempts=0, cycle=0, replayed_by
+      security: [{ admin: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                ids: { type: array, items: { type: string } }
+                lane: { type: string }
+                provider: { type: string }
+                since: { type: string, format: date-time }
+                limit: { type: integer, minimum: 1, maximum: 10000 }
+      responses: { "200": { description: "{replayed, ids}" }, "400": { description: "A selector (ids, lane or provider) is required" } }
+  /api/v1/admin/cooldowns:
+    get:
+      summary: Active lane cool-downs
+      security: [{ admin: [] }]
+      responses: { "200": { description: "Cool-downs" } }
+    delete:
+      summary: Clear one lane's cool-down
+      security: [{ admin: [] }]
+      parameters: [{ in: query, name: lane, required: true, schema: { type: string } }]
+      responses: { "200": { description: "Cleared" } }
+  /api/v1/admin/queue/stats:
+    get:
+      summary: Queue depth, oldest age, top lanes, pause flag
+      security: [{ admin: [] }]
+      responses: { "200": { description: "Stats" } }
+  /api/v1/admin/ingress/pause:
+    post:
+      summary: Pause ingress for every pod (ingress answers 429 ingest_backpressure reason ingress_paused)
+      security: [{ admin: [] }]
+      responses: { "200": { description: "Paused" } }
+  /api/v1/admin/ingress/resume:
+    post:
+      summary: Resume ingress
+      security: [{ admin: [] }]
+      responses: { "200": { description: "Resumed" } }
+components:
+  securitySchemes:
+    admin:
+      type: http
+      scheme: bearer
+      description: RELAYFILE_CONTROL_ADMIN_TOKEN (comma list for rotation), constant-time compare.
+  responses:
+    Ingress202: { description: "Accepted (durable), dropped (Nango without provider id) or ignored (unknown GitHub installation)", content: { application/json: { schema: { oneOf: [{ $ref: "#/components/schemas/Accepted" }, { $ref: "#/components/schemas/Dropped" }, { $ref: "#/components/schemas/Ignored" }] } } } }
+    Ingress200: { description: "Duplicate delivery (already held), or Slack url_verification", content: { application/json: { schema: { $ref: "#/components/schemas/Duplicate" } } } }
+    Ingress400: { description: "invalid_json (after a valid signature)" }
+    Ingress401: { description: "invalid_signature (no further detail)" }
+    Ingress403: { description: "feature_not_licensed" }
+    Ingress404: { description: "unknown_installation (only with INGRESS_REJECT_UNKNOWN_INSTALLATION=1)" }
+    Ingress413: { description: "payload_too_large" }
+    Ingress429: { description: "ingest_backpressure with reason and Retry-After" }
+    Ingress503: { description: "ingress_not_configured or storage_unavailable" }
+  requestBodies:
+    Raw25MiB:
+      required: true
+      description: Raw bytes, verified before parse. Capped at INGRESS_MAX_BODY_BYTES (25 MiB) while streaming.
+      content: { application/json: { schema: { type: object } } }
+    Raw1MiB:
+      required: true
+      description: Raw bytes, verified before parse. Capped at INGRESS_MAX_BODY_BYTES_OTHER (1 MiB) while streaming.
+      content: { application/json: { schema: { type: object } } }
+  schemas:
+    Accepted:
+      type: object
+      required: [accepted, requestId, queue]
+      properties:
+        accepted: { const: true }
+        requestId: { type: string, description: "ULID; the end-to-end correlation id" }
+        queue: { const: webhook-events }
+    Duplicate:
+      type: object
+      properties: { accepted: { const: true }, duplicate: { const: true } }
+    Dropped:
+      type: object
+      properties: { accepted: { const: true }, dropped: { const: true }, reason: { const: missing_nango_provider_identifier } }
+    Ignored:
+      type: object
+      properties: { accepted: { const: true }, ignored: { const: true }, reason: { const: unknown_installation } }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          enum: [invalid_signature, invalid_json, invalid_body, payload_too_large, ingest_backpressure, ingress_not_configured, storage_unavailable, feature_not_licensed, unknown_installation, method_not_allowed]
+        reason: { enum: [lane_queue_full, global_queue_full, lane_stale_cooldown, ingress_paused] }
+        retryAfterSeconds: { type: integer }
+        feature: { const: relayfile }
+    Readiness:
+      type: object
+      properties:
+        ready: { type: boolean }
+        db: { type: boolean }
+        migration: { type: object, properties: { current: { type: [string, "null"] }, latest: { type: [string, "null"] }, upToDate: { type: boolean } } }
+        entitlement:
+          type: object
+          properties:
+            entitled: { type: boolean }
+            source: { enum: [relaycontrol, license_document, grace, null] }
+            reason: { type: string }
+        ingressPaused: { type: boolean }
+        role: { enum: [ingress, consumer, all] }
+    BindingInput:
+      type: object
+      additionalProperties: false
+      required: [workspaceId, provider, connectionId]
+      properties:
+        workspaceId: { type: string, pattern: "^rw_" }
+        provider: { type: string, maxLength: 64 }
+        connectionId: { type: string }
+        providerConfigKey: { type: [string, "null"] }
+        nativeIds:
+          type: object
+          additionalProperties: false
+          properties:
+            installation_id: { type: string }
+            team_id: { type: string }
+            enterprise_id: { type: string }
+            organization_id: { type: string }
+            cloud_id: { type: string }
+            email: { type: string }
+        relayfileBaseUrl: { type: [string, "null"], format: uri }
+        status: { enum: [active, disabled] }

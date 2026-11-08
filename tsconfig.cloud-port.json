@@ -1,0 +1,11 @@
+{
+  "//": "Cloud test files ported verbatim (plan §13 table). Cloud's tsconfig has no noUncheckedIndexedAccess; relaxing only that keeps them diffable against Cloud.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noUncheckedIndexedAccess": false, "noEmit": true },
+  "include": [],
+  "files": [
+    "test/relayfile/backpressure.test.ts",
+    "test/relayfile/admission-retry.test.ts",
+    "test/consumer/retry-delay.test.ts"
+  ]
+}
