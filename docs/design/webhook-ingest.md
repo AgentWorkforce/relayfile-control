@@ -358,9 +358,13 @@ such route. See §11 capability.
 Port the module nearly verbatim as `src/relayfile/backpressure.ts`, including
 its tests:
 
-- Retry only on 429 and 503 (503 added here per layered-relayfile: cloud
-  `storage_full`/`root_event_outbox_full`, OSS secret-unset). No branching on
-  body `reason`; all are "back off per Retry-After, bounded attempts".
+- In-place retry only on 429, exactly as Cloud final (`retryRelayfileBackpressure`
+  loops while `response.status === 429`). No branching on body `reason`.
+  Retrying 503 in place (layered-relayfile's ask for cloud `storage_full`/
+  `root_event_outbox_full` and OSS secret-unset) is an explicit option
+  `RELAYFILE_BACKPRESSURE_RETRY_503` default **off**, so the default is a
+  behaviour-identical port; a 503 without the option is a `retry` disposition
+  (§4.4) with the schedule delay, never an ack.
 - One wall-clock budget bounds when a retry may *start*; per-attempt caller
   timeout; strictly sequential; a rejected `post()` propagates at once.
 - Delay precedence: `Retry-After` (delta-seconds or IMF-fixdate) → body
@@ -373,23 +377,39 @@ its tests:
 - `inPlaceRetryPolicy(provider)`: `{maxRetries:1, budgetMs:30000,
   attemptTimeoutMs:15000}` for long-deadline providers, `{maxRetries:0,
   budgetMs:0}` otherwise (Slack/Jira under the 15 s deadline). Envelope
-  admission: 1 retry, 30 s budget, 15 s attempt. Provider-writes: 1 retry,
-  30 s budget, 30 s attempt.
+  admission: `ADMISSION_MAX_RETRIES 1`, `ADMISSION_RETRY_BUDGET_MS 30 000`,
+  `ADMISSION_ATTEMPT_TIMEOUT_MS 15 000`. Provider-writes:
+  `PROVIDER_WRITE_MAX_RETRIES 1`, `PROVIDER_WRITE_RETRY_BUDGET_MS 30 000`
+  (Cloud sets no separate per-attempt timeout there; the handler deadline
+  bounds it).
+- **Jira native comment path** (`jira:comment_created`, `objectType ==
+  "comment"`, Cloud router ~8355-8385): the per-item writes run under the same
+  policy; the FIRST `RelayfileBackpressureError` is kept (`backpressure ??=`)
+  and rethrown as the typed error after the loop, before the generic
+  "normalization or admission failed" error, so the consumer's `retry`
+  honours Retry-After instead of the fixed schedule. Port
+  `nango-webhook-router-jira-forward-backpressure.test.ts`.
 - Record-writer bulk path: `BULK_WRITE_BUSY_RETRY_MAX_ATTEMPTS 6`, base 500 ms,
   max 30 s, deadline 240 s, retrying only 429 `workspace_busy`/`queue_full`;
   a final 429 surfaces as `backpressureError` on `BatchWriteResult` and is
   rethrown as `RelayfilePrimaryWriteError {cause, retryAfterMs}`.
 
 End-to-end **HARD**: a final backpressure error must become `retry` with
-`retryAfterSeconds = max(1, ceil(retryAfterMs/1000))` or default 60, never an
-ack, never a drop, and the envelope's `last_outcome` records
+`retryAfterSeconds = max(1, ceil(retryAfterMs/1000))` or default 60
+(`RELAYFILE_BACKPRESSURE_DEFAULT_RETRY_AFTER_SECONDS`), never an ack, never a
+drop. This is Cloud's route-handler "typed `RelayfileBackpressureError` →
+503 + Retry-After" contract collapsed into one process: there is no HTTP hop
+between route and consumer here, so the 503 becomes the `retry` disposition
+with the same `retryAfterSeconds`; the error is detected by `instanceof` OR
+`error.name === "RelayfileBackpressureError"` OR the same on `error.cause`
+(`detectRelayfileBackpressure`), exactly as Cloud. Never an ack, never a drop, and the envelope's `last_outcome` records
 `{disposition:"retry", code:"relayfile_backpressure", status, surface,
 relayfileReason, retryAfterSeconds, retryDelaySeconds, attempts}`. Test:
 fake Relayfile returning 429 forever ⇒ exactly `maxRetries+1` posts per
 attempt, N queue attempts with lengthening delays, then DLQ with full reason
 chain; a 429 followed by 202 ⇒ ack.
 
-### 6.3 Workspace cool-down (cloud#6177, optional, on by default here)
+### 6.3 Workspace cool-down (cloud#6177 Option D, optional, **default off**)
 
 Cloud's version was isolate-local and keyed by Nango connection because the
 worker did not know the workspace. Here the consumer knows the lane, so:
@@ -397,8 +417,20 @@ worker did not know the workspace. Here the consumer knows the lane, so:
 - Table `lane_cooldowns(lane PK, until timestamptz, armed_by, reason)`; armed
   on a final backpressure error with window = Retry-After delta > 0 → body
   `retryAfterSeconds` > 0 → 60, clamped [1, 86 400]; lengthen-only; expire
-  on read. `COOLDOWN_ENABLED` default true, `COOLDOWN_MAX_KEYS` 1000 (LRU
-  prune by oldest `until`).
+  on read. `COOLDOWN_ENABLED` default **false** (Khaliq, 2026-11-08: ship as
+  a default-off option), `COOLDOWN_MAX_KEYS` 1000 (LRU prune by oldest
+  `until`). Arming contract identical to #6177 @bda4057: arm only on a final
+  backpressure error (never on 429/502/other 5xx/timeouts/network); window =
+  Retry-After header → body `retryAfterSeconds` → 60; clamp [1, 86 400];
+  longer extends, shorter never shortens; skip delay = the §4.4 schedule with
+  `retryAfterSeconds = ceil(remaining)`; one `forward_cooldown_skip` warn per
+  skip with the 16-hex key hash, `cooldownArmedSeconds` on the rejected line;
+  no payload, raw key, connection id or secret logged. Port the 12 tests from
+  `workspace-cooldown.test.ts`. Known differences from Cloud, both deliberate:
+  key = lane (workspace is known here) instead of `providerConfigKey +
+  connectionId`; store = table shared by all consumers instead of
+  isolate-local memory; a skip does NOT consume a queue attempt (rows are
+  simply not claimed), whereas Cloud's skip costs one of the 6 deliveries.
 - Effect: the claim query skips cooled lanes (§4.2) — no work is dequeued for
   a workspace that just told us it is busy, so the budget goes to other
   workspaces. It is advisory: rows stay `queued` with their own `visible_at`
@@ -453,7 +485,10 @@ to keep:
   delete for an object fails, its remaining writes are rejected so the by-id
   alias keeps describing the old state; in staged bulk mode each numbered write
   carries `dependsOn` on its deletes and Relayfile fails it with
-  `dependency_failed`). Port the 21 tests from #6176 (`record-writer.test.ts`).
+  `dependency_failed`). Source = #6176 head 5158f41 (802b0f4 coalescing,
+  fe700c9 auxiliary-effects repair, 5158f41 alias-cleanup intent). Port the
+  21 tests from #6176 (`record-writer.test.ts`) plus the +33 lines #6175 added
+  to the same file (bulk-write busy retry).
 - Auxiliary files staged after canonical with `dependsOn`; dependents of
   failed paths skipped.
 
@@ -578,6 +613,38 @@ claim state machine; retry-delay properties; backpressure module (port
 Cloud's tests); route failure classification; cool-down store; entitlement
 verifier (good/expired/wrong-feature/bad-signature); record-writer incl. the
 #6176 21 tests.
+
+cloud#6175 regression tests, ported one-to-one (Cloud path → here), all
+**HARD** for PR 1 unless marked PR 2:
+
+| Cloud @ 1a59dec | relayfile-control |
+|---|---|
+| `web/lib/integrations/relayfile-backpressure.test.ts` (455 lines) | `test/relayfile/backpressure.test.ts` |
+| `web/lib/integrations/github-webhook-admission-retry.test.ts` | `test/relayfile/admission-retry.test.ts` |
+| `web/lib/integrations/github-webhook-ingest.admission-retry.test.ts` | `test/consumer/admission-retry.test.ts` |
+| `web/lib/integrations/github-webhook-ingest.provider-writes-backpressure.test.ts` | `test/providers/github/provider-writes-backpressure.test.ts` (PR 2) |
+| `web/lib/integrations/nango-webhook-route-handler.test.ts` (+69, backpressure classification) | `test/consumer/dispositions.test.ts` |
+| `web/lib/integrations/nango-webhook-router-jira-forward-backpressure.test.ts` | `test/providers/jira/forward-backpressure.test.ts` (PR 2) |
+| `webhook-worker/src/queue-retry-delay.test.ts` (113 lines) | `test/consumer/retry-delay.test.ts` |
+| `webhook-worker/test/queue.test.ts` (+148, Retry-After honoured, never ack) | `test/consumer/queue.test.ts` |
+| `core/tests/record-writer.test.ts` (+33, bulk busy retry) | `test/recordwriter/record-writer.test.ts` (PR 2) |
+| `webhook-worker/test/workspace-cooldown.test.ts` (#6177, 12 tests) | `test/consumer/cooldown.test.ts` |
+
+Each ported file keeps Cloud's test names so a reviewer can diff them.
+
+### 13.1 cloud#6175 backfill checklist (Khaliq, 2026-11-08, message 245080494008729600)
+
+| Final behaviour (cloud trunk 1a59dec / main e1ae98ef) | Lands in |
+|---|---|
+| single in-place retry for admission + provider-writes | §6.2 policy constants |
+| lengthen-only positive jitter, server Retry-After as a hard floor | §6.2 (hint ×(1+U[0,0.25))), §4.4 (queue schedule, 86 400 cap) |
+| typed `RelayfileBackpressureError` → 503 + Retry-After, incl. Jira native-comment path | §6.2 end-to-end paragraph + Jira bullet, §4.4 `retry` disposition |
+| Slack/Jira 0 in-place retries under the 15 s forward deadline | §4.3, §6.2 `inPlaceRetryPolicy` |
+| queue retry delay honouring Retry-After, 86 400 s cap | §4.4 |
+| never ack/drop on retryable | §4.4, §6.2 **HARD** |
+| same regression tests ported | §13 table |
+| #6177 per-workspace cool-down, default-off option | §6.3 |
+| #6176 identical-retry coalescing with the repair fix | §7 (head 5158f41) |
 
 Integration (real PG, opt-in): two consumers racing SKIP LOCKED claims;
 per-lane fairness under a 10 000-row single-lane flood with a second lane
