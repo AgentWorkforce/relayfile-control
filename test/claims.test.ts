@@ -55,6 +55,34 @@ describe("handler claims state machine (§3, PGlite)", () => {
     assert.deepEqual(await claim(db, c), { claimed: true, attempts: 2 });
     await db.close();
   });
+  it("a holder that fails between our upsert and the read-back is in flight (retry), never a duplicate", async () => {
+    const db = await newPglite();
+    const c = { surface: "nango-forward", dedupeId: "race", leaseSeconds: 900 };
+    await claim(db, c); // holder A, live lease
+    // B's upsert loses to A's live claim; A then fails before B reads the row back.
+    const racing = {
+      async query<T>(sql: string, params?: unknown[]) {
+        const r = await db.query<T>(sql, params);
+        if (sql.includes("INSERT INTO webhook_delivery_claims")) await failClaim(db, c.surface, c.dedupeId, 1);
+        return r;
+      },
+    };
+    assert.deepEqual(await claim(racing, c), { claimed: false, inFlight: true });
+    // A completed claim swept by retention between the upsert and the read-back reads as a duplicate.
+    const d = { surface: "nango-forward", dedupeId: "swept", leaseSeconds: 900 };
+    await claim(db, d);
+    await completeClaim(db, d.surface, d.dedupeId, 1);
+    const sweeping = {
+      async query<T>(sql: string, params?: unknown[]) {
+        const r = await db.query<T>(sql, params);
+        if (sql.includes("INSERT INTO webhook_delivery_claims")) await db.query("DELETE FROM webhook_delivery_claims WHERE dedupe_id = 'swept'");
+        return r;
+      },
+    };
+    assert.deepEqual(await claim(sweeping, d), { claimed: false, inFlight: false });
+    await db.close();
+  });
+
   it("surfaces are independent", async () => {
     const db = await newPglite();
     assert.equal((await claim(db, { surface: "a", dedupeId: "x", leaseSeconds: 1 })).claimed, true);

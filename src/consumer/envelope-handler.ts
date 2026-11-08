@@ -177,7 +177,11 @@ export const forwardEnvelope: EnvelopeHandler = async (row, ctx) => {
     } finally {
       ctx.metrics.observe("relayfile_request_seconds", (Date.now() - started) / 1000, { surface: "webhook-envelopes" });
     }
-    if (claimSurface && claimId) await completeClaim(ctx.db, claimSurface, claimId, claimAttempt);
+    if (claimSurface && claimId && !(await completeClaim(ctx.db, claimSurface, claimId, claimAttempt))) {
+      // Delivered, but a newer attempt now owns the claim (our lease expired): record it, the ack stands.
+      ctx.logger.event("claim_complete_fenced", { area: "consumer", requestId: row.request_id, surface: claimSurface, attempt: claimAttempt });
+      ctx.metrics.inc("claim_complete_fenced_total", { surface: claimSurface });
+    }
     return {
       type: "ack",
       reason: result.outcome === "duplicate" ? "relayfile_duplicate_envelope" : `relayfile_${result.outcome}`,

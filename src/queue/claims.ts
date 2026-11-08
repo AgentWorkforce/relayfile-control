@@ -43,7 +43,11 @@ export async function claim(
     input.surface,
     input.dedupeId,
   ]);
-  return { claimed: false, inFlight: existing.rows[0]?.status === "processing" };
+  // Not reclaimed: a completed row is a true duplicate. Any other row means a transition between the
+  // upsert and this read (a `failed` row cannot have blocked the upsert, which reclaims failed rows), so
+  // retry. A missing row was a purged completed claim (only completed rows are swept): duplicate.
+  const status = existing.rows[0]?.status;
+  return { claimed: false, inFlight: status !== undefined && status !== "completed" };
 }
 
 /**
