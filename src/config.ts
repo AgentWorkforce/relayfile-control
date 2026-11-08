@@ -65,7 +65,8 @@ export const ConfigSchema = z.object({
   CONSUMER_IDLE_POLL_MS: int(500, 10, 60_000),
 
   // §6.3 cool-down.
-  COOLDOWN_ENABLED: bool(true),
+  /** #6177 per-workspace cool-down: ships as a default-off option (Khaliq, plan §6.3). */
+  COOLDOWN_ENABLED: bool(false),
   COOLDOWN_MAX_KEYS: int(1000, 1, 1_000_000),
 
   // §8 DLQ / retention.
@@ -78,6 +79,8 @@ export const ConfigSchema = z.object({
   RELAYFILE_BASE_URL: optional,
   RELAYFILE_INTERNAL_HMAC_SECRET: optional,
   RELAYFILE_FLAVOR: z.enum(["oss", "cloud"]).default("oss"),
+  /** Retry 503 (and OSS 500) in place like 429; default off = identical to cloud#6175 final (§6.2). */
+  RELAYFILE_BACKPRESSURE_RETRY_503: bool(false),
   /** Provider-writes client is gated on this, not on flavour (plan §11, f9d0241). PR 2 consumes it. */
   RELAYFILE_PROVIDER_WRITES: bool(false),
 

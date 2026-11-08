@@ -1,12 +1,13 @@
 // Ported from cloud packages/web/lib/integrations/relayfile-backpressure.ts @ 1a59dec
-// (cloud#6175, plan §6.2). Changes from Cloud, all per the plan:
-//  - 503 is retried like 429 (layered-relayfile: cloud storage_full /
-//    root_event_outbox_full, OSS secret-unset), and OSS plain 500 gets the same
-//    bounded retry (plan §14.3). `retryStatuses` names the set.
-//  - A final 429/503 throws RelayfileBackpressureError; a final 500 throws
-//    RelayfileServerError (queue schedule, no cool-down).
+// (cloud#6175 final, plan §6.2 / §13.1). The default behaviour is identical to
+// Cloud: only 429 is retried in place and only a final 429 throws
+// RelayfileBackpressureError. Additions, all opt-in or observational:
+//  - `retry503` (RELAYFILE_BACKPRESSURE_RETRY_503, default off): 503 is retried
+//    in place and a final 503 is backpressure too; an OSS plain 500 gets the
+//    same bounded in-place retry and a final 500 throws RelayfileServerError.
 //  - `onBackpressure` observes every retryable response, including ones retried
-//    in place, for the `relayfile_backpressure` event (§10).
+//    in place, for the `relayfile_backpressure` event (§10), and the typed
+//    error carries `relayfileReason`.
 
 /**
  * Shared bounded backoff for Relayfile per-workspace admission 429s
@@ -40,8 +41,8 @@
  *  - A delay that would start at or past the deadline defers to the durable
  *    queue: the final 429 becomes a typed `RelayfileBackpressureError` that the
  *    webhook route maps to a retryable 503 + `Retry-After`.
- *  - 429, 503 and 500 are retried here (see the port note above). Every other
- *    status is returned untouched for the caller to judge.
+ *  - Only 429 is retried here (503/500 only with `retry503`). 5xx and every
+ *    other status are returned untouched for the caller to judge.
  *  - Response bodies are never logged or copied into error messages.
  */
 
@@ -74,10 +75,15 @@ export function parseRetryAfterMs(
 
 export type RelayfileBackpressureSurface = "webhook-envelopes" | "provider-writes";
 
-/** Statuses that are "back off and retry, bounded": admission/storage pressure. */
-export const BACKPRESSURE_STATUSES: ReadonlySet<number> = new Set([429, 503]);
-/** Retried in place like backpressure, but not treated as a workspace being busy. */
-export const RETRY_IN_PLACE_STATUSES: ReadonlySet<number> = new Set([429, 503, 500]);
+/** Cloud final: only 429 is retried in place and is backpressure. */
+const DEFAULT_RETRY_STATUSES: ReadonlySet<number> = new Set([429]);
+/** With `retry503`: 503 joins 429 as backpressure; 500 gets the bounded retry but is not backpressure. */
+const RETRY_503_STATUSES: ReadonlySet<number> = new Set([429, 503, 500]);
+const RETRY_503_BACKPRESSURE: ReadonlySet<number> = new Set([429, 503]);
+
+export function retryStatusesFor(retry503: boolean): ReadonlySet<number> {
+  return retry503 ? RETRY_503_STATUSES : DEFAULT_RETRY_STATUSES;
+}
 
 /**
  * Thrown when Relayfile still answers 429 after the bounded in-place retries.
@@ -328,8 +334,8 @@ export type RelayfileBackpressureOptions = {
   random?: () => number;
   /** Consult the JSON body for a retry hint when the header is absent (default true). */
   readBodyRetryAfterSeconds?: boolean;
-  /** Statuses retried in place (default 429, 503, 500). */
-  retryStatuses?: ReadonlySet<number>;
+  /** RELAYFILE_BACKPRESSURE_RETRY_503 (default false): also retry 503 (backpressure) and 500 in place. */
+  retry503?: boolean;
   /** Observes every retryable response, including ones retried in place (§10 `relayfile_backpressure`). */
   onBackpressure?: (event: {
     status: number;
@@ -360,9 +366,10 @@ export async function retryRelayfileBackpressure({
   sleep = defaultSleep,
   random = Math.random,
   readBodyRetryAfterSeconds: readBody = true,
-  retryStatuses = RETRY_IN_PLACE_STATUSES,
+  retry503 = false,
   onBackpressure,
 }: Omit<RelayfileBackpressureOptions, "surface">): Promise<RelayfileBackpressureOutcome> {
+  const retryStatuses = retryStatusesFor(retry503);
   const deadlineMs = now() + budgetMs;
   let response = await post();
   let attempts = 1;
@@ -405,13 +412,14 @@ export async function retryRelayfileBackpressure({
 /**
  * Issue `post()`, retrying 429 in place within `maxRetries` / `budgetMs`.
  * Non-429 responses are returned untouched. A final 429 has its body cancelled
- * and is thrown as `RelayfileBackpressureError`.
+ * and is thrown as `RelayfileBackpressureError` (with `retry503`, likewise a
+ * final 503; a final 500 is thrown as `RelayfileServerError`).
  */
 export async function fetchWithRelayfileBackpressure(options: RelayfileBackpressureOptions): Promise<Response> {
   const now = options.now ?? (() => Date.now());
-  const retryStatuses = options.retryStatuses ?? RETRY_IN_PLACE_STATUSES;
-  const { response, attempts } = await retryRelayfileBackpressure({ ...options, now, retryStatuses });
-  if (!retryStatuses.has(response.status)) return response;
+  const retry503 = options.retry503 ?? false;
+  const { response, attempts } = await retryRelayfileBackpressure({ ...options, now, retry503 });
+  if (!retryStatusesFor(retry503).has(response.status)) return response;
   const nowMs = now();
   const headerMs = parseRetryAfterMs(response.headers.get("retry-after"), nowMs);
   // Cloud rule: the body is only consulted when the header is absent/malformed.
@@ -428,7 +436,7 @@ export async function fetchWithRelayfileBackpressure(options: RelayfileBackpress
     relayfileReason: hint.reason,
   });
   await cancelBestEffort(response);
-  if (!BACKPRESSURE_STATUSES.has(response.status)) {
+  if (!(retry503 ? RETRY_503_BACKPRESSURE : DEFAULT_RETRY_STATUSES).has(response.status)) {
     throw new RelayfileServerError({ status: response.status, attempts, surface: options.surface, relayfileReason: hint.reason });
   }
   throw new RelayfileBackpressureError({

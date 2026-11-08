@@ -1,4 +1,5 @@
 import { providerFamily } from "../envelope/classify.ts";
+import { ADMISSION_ATTEMPT_TIMEOUT_MS } from "../relayfile/admission-retry.ts";
 import { ENVELOPE_ADMISSION_POLICY, type InPlacePolicy } from "../relayfile/client.ts";
 
 const LONG_DEADLINE_FAMILIES = new Set(["github", "google", "linear", "notion"]);
@@ -11,8 +12,8 @@ export function handlerDeadlineMs(provider: string): number {
 /** §6.2: one in-place retry for long-deadline providers, none under the 15 s deadline. */
 export function inPlaceRetryPolicy(provider: string): InPlacePolicy {
   return LONG_DEADLINE_FAMILIES.has(providerFamily(provider))
-    ? { maxRetries: 1, budgetMs: 30_000, attemptTimeoutMs: 15_000 }
-    : { maxRetries: 0, budgetMs: 0, attemptTimeoutMs: 15_000 };
+    ? { ...ENVELOPE_ADMISSION_POLICY }
+    : { maxRetries: 0, budgetMs: 0, attemptTimeoutMs: ADMISSION_ATTEMPT_TIMEOUT_MS };
 }
 
 /** Envelope admission policy bounded by the provider's in-place policy (Slack/Jira get no in-place retry). */

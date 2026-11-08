@@ -16,7 +16,9 @@ function format(name: string, args: unknown[]): string {
 export const describe = (name: string, fn: () => void) => nodeDescribe(name, fn);
 
 type ItFn = ((name: string, fn: Fn) => void) & {
-  each: <T>(rows: readonly T[]) => (name: string, fn: (...args: T extends readonly unknown[] ? T : [T]) => unknown) => void;
+  // Loosely typed on purpose: vitest's per-position inference is not reproduced by this shim.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  each: <T>(rows: readonly T[]) => (name: string, fn: (...args: any[]) => unknown) => void;
 };
 
 export const it: ItFn = Object.assign((name: string, fn: Fn) => nodeIt(name, async () => { await fn(); }), {

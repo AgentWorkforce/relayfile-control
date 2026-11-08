@@ -1,6 +1,6 @@
 // Ported from cloud packages/web/lib/integrations/relayfile-backpressure.test.ts @ 1a59dec (cloud#6175).
-// Cloud-only-429 assertions are adapted where this port also retries 503/500 (marked PORT).
-import { describe, expect, it, vi } from "./support/vitest-compat.ts";
+// Cloud's tests are verbatim (vitest → ./support/vitest-compat.ts); additions are marked PORT.
+import { describe, expect, it, vi } from "../support/vitest-compat.ts";
 
 import {
   RELAYFILE_BACKPRESSURE_FALLBACK,
@@ -11,7 +11,7 @@ import {
   RelayfileServerError,
   fetchWithRelayfileBackpressure,
   resolveRelayfileBackpressureDelayMs,
-} from "../src/relayfile/backpressure.ts";
+} from "../../src/relayfile/backpressure.ts";
 
 const { baseMs, maxMs, jitterRatio } = RELAYFILE_BACKPRESSURE_FALLBACK;
 const hintJitterRatio = RELAYFILE_BACKPRESSURE_SERVER_HINT_JITTER_RATIO;
@@ -74,7 +74,7 @@ function harness(script: Array<() => Response>, opts: { overshootMs?: number } =
     postTimes.push(clock);
     const next = script[Math.min(i, script.length - 1)];
     i += 1;
-    return next!(); // PORT: non-null under noUncheckedIndexedAccess
+    return next();
   });
   return {
     post,
@@ -213,10 +213,8 @@ describe("fetchWithRelayfileBackpressure", () => {
     expect(error).toMatchObject({ retryAfterMs: 2_000, attempts: 2 });
   });
 
-  // PORT: Cloud returned 500/503 untouched. Here 503 is backpressure (plan §6.2) and
-  // OSS plain 500 gets the same bounded retry (plan §14.3); other statuses stay untouched.
-  it("200, 400 and 502 are returned untouched with no retry", async () => {
-    for (const status of [200, 400, 502]) {
+  it("200 and 500 are returned untouched with no retry", async () => {
+    for (const status of [200, 500, 503]) {
       const h = harness([() => respond(status)]);
       const res = await fetchWithRelayfileBackpressure({ ...h, surface, maxRetries: 2, budgetMs: 30_000 });
       expect(res.status).toBe(status);
@@ -225,25 +223,26 @@ describe("fetchWithRelayfileBackpressure", () => {
     }
   });
 
-  it("PORT: 503 is retried like 429 and a final 503 is a RelayfileBackpressureError", async () => {
+  // PORT (additions, not in Cloud): RELAYFILE_BACKPRESSURE_RETRY_503 (default off, plan §6.2).
+  it("PORT: with retry503, 503 is retried like 429 and a final 503 is a RelayfileBackpressureError", async () => {
     const h = harness([() => respond(503, { headers: { "retry-after": "1" } })]);
-    const error = await fetchWithRelayfileBackpressure({ ...h, surface, maxRetries: 2, budgetMs: 30_000 }).catch((e: unknown) => e);
+    const error = await fetchWithRelayfileBackpressure({ ...h, surface, maxRetries: 2, budgetMs: 30_000, retry503: true }).catch((e: unknown) => e);
     expect(h.post).toHaveBeenCalledTimes(3);
     expect(error).toBeInstanceOf(RelayfileBackpressureError);
     expect(error).toMatchObject({ status: 503, retryAfterMs: 1_000, attempts: 3, surface });
   });
 
-  it("PORT: 500 gets the bounded retry and a final 500 is a RelayfileServerError (no cool-down)", async () => {
+  it("PORT: with retry503, an OSS 500 gets the bounded retry and a final 500 is a RelayfileServerError", async () => {
     const h = harness([() => respond(500)]);
-    const error = await fetchWithRelayfileBackpressure({ ...h, surface, maxRetries: 1, budgetMs: 30_000 }).catch((e: unknown) => e);
+    const error = await fetchWithRelayfileBackpressure({ ...h, surface, maxRetries: 1, budgetMs: 30_000, retry503: true }).catch((e: unknown) => e);
     expect(h.post).toHaveBeenCalledTimes(2);
     expect(error).toBeInstanceOf(RelayfileServerError);
     expect(error).toMatchObject({ status: 500, attempts: 2, surface });
   });
 
-  it("PORT: a 500 then 202 succeeds", async () => {
+  it("PORT: with retry503, a 500 then 202 succeeds", async () => {
     const h = harness([() => respond(500), () => respond(202)]);
-    const res = await fetchWithRelayfileBackpressure({ ...h, surface, maxRetries: 1, budgetMs: 30_000 });
+    const res = await fetchWithRelayfileBackpressure({ ...h, surface, maxRetries: 1, budgetMs: 30_000, retry503: true });
     expect(res.status).toBe(202);
     expect(h.post).toHaveBeenCalledTimes(2);
   });
@@ -357,7 +356,7 @@ describe("fetchWithRelayfileBackpressure", () => {
     ["non-JSON body", { headers: { "content-type": "text/html" }, body: "<html>busy</html>" }],
     ["malformed JSON body", { headers: { "content-type": "application/json" }, body: "{not json" }],
   ])("every 429 reason backs off the same way regardless of body (%s)", async (_label, init) => {
-    const h = harness([() => respond(429, init as { headers?: Record<string, string>; body?: string })]);
+    const h = harness([() => respond(429, init)]);
     const error = await fetchWithRelayfileBackpressure({ ...h, surface, maxRetries: 2, budgetMs: 30_000, random: () => 0.5 }).catch((e: unknown) => e);
     expect(h.post).toHaveBeenCalledTimes(3);
     expect(h.sleeps).toEqual([1_000, 2_000]);

@@ -20,7 +20,7 @@ import { fakeRelayfile, FIXTURE, fixtureConfig, sign, startApp } from "./support
 const STORM_SECONDS = 120;
 const STEP_SECONDS = 15;
 
-async function runStorm(flavour: "oss" | "cloud") {
+async function runStorm(flavour: "oss" | "cloud", cooldown: boolean) {
   let simulated = 0; // seconds since the storm started
   const fake = await fakeRelayfile({
     flavor: flavour,
@@ -38,6 +38,7 @@ async function runStorm(flavour: "oss" | "cloud") {
     CONSUMER_CONCURRENCY: "10",
     PER_LANE_MAX_INFLIGHT: "2",
     MAX_ATTEMPTS: "5",
+    COOLDOWN_ENABLED: cooldown ? "true" : "false",
   });
   const t = await startApp({ config });
   await upsertBinding(t.db, { workspaceId: "rw_storm", provider: "notion", connectionId: "conn-storm" });
@@ -73,7 +74,6 @@ async function runStorm(flavour: "oss" | "cloud") {
   const counts = async () =>
     (await t.db.query<{ lane: string; state: string; n: number }>("SELECT lane, state, count(*)::int AS n FROM webhook_envelopes GROUP BY lane, state")).rows;
 
-  let redelivered = false;
   for (let step = 0; step < 200; step += 1) {
     await new Promise((r) => setTimeout(r, 60));
     if ((await t.app.cooldowns.list()).length > 0) cooldownSeenArmed = true;
@@ -83,18 +83,17 @@ async function runStorm(flavour: "oss" | "cloud") {
     const calmOpen = c.filter((r) => r.lane === "rw_calm" && r.state !== "done").reduce((a, r) => a + r.n, 0);
     const calmTotal = c.filter((r) => r.lane === "rw_calm").reduce((a, r) => a + r.n, 0);
     if (calmDoneAt === null && calmTotal > 0 && calmOpen === 0) calmDoneAt = simulated;
-    // Providers redeliver what ingress refused with 429, once the storm is over.
-    if (!redelivered && simulated >= STORM_SECONDS + 60) {
-      redelivered = true;
+    // Providers keep redelivering what ingress refused with 429 (with their own backoff);
+    // here once per simulated step after the storm, until each one is accepted.
+    if (simulated >= STORM_SECONDS + 60) {
       for (const r of ingress.filter((x) => x.status === 429)) {
         const d = delivery(r.conn, r.i);
-        const again = await t.post("/api/v1/webhooks/nango", d.body, d.headers);
-        r.status = again.status;
+        r.status = (await t.post("/api/v1/webhooks/nango", d.body, d.headers)).status;
       }
-      continue; // re-measure after the redelivery before deciding we are done
+      const after = await counts();
+      const open = after.filter((r) => r.state !== "done").reduce((a, r) => a + r.n, 0);
+      if (ingress.every((x) => x.status !== 429) && open === 0) break;
     }
-    const open = c.filter((r) => r.state !== "done").reduce((a, r) => a + r.n, 0);
-    if (redelivered && open === 0) break;
     await warp(STEP_SECONDS);
   }
   await consumer.stop();
@@ -113,6 +112,7 @@ async function runStorm(flavour: "oss" | "cloud") {
   const accepted202 = ingress.filter((x) => x.status === 202).length;
   const report = {
     flavour,
+    cooldownEnabled: cooldown,
     simulatedSeconds: simulated,
     stormSeconds: STORM_SECONDS,
     ingress: {
@@ -137,31 +137,39 @@ async function runStorm(flavour: "oss" | "cloud") {
     dlqArchived: archived,
     finalStates: finalCounts,
   };
-  const file = path.join(process.env.TMPDIR ?? ".", `e2e-storm-report-${flavour}.md`);
-  await writeFile(file, `# e2e storm report (${flavour})\n\n\`\`\`json\n${JSON.stringify(report, null, 2)}\n\`\`\`\n`);
+  const name = `${flavour}-cooldown-${cooldown ? "on" : "off"}`;
+  const file = path.join(process.env.TMPDIR ?? ".", `e2e-storm-report-${name}.md`);
+  await writeFile(file, `# e2e storm report (${name})\n\n\`\`\`json\n${JSON.stringify(report, null, 2)}\n\`\`\`\n`);
   await t.close();
   await fake.close();
   return { report, file, ingress };
 }
 
 for (const flavour of ["oss", "cloud"] as const) {
-  describe(`e2e: Nov 7 storm against fake Relayfile (${flavour})`, () => {
-    it("ingress sheds with reasons, other lanes unaffected, cool-down armed and released, no unwritten acks, no drops, DLQ empty", async () => {
-      const { report, file } = await runStorm(flavour);
-      console.log(`[e2e ${flavour}] report: ${file}\n${JSON.stringify({ ...report, finalStates: undefined })}`);
-      assert.ok(report.ingress.refused429 > 0, "ingress 429s once the lane cap is hit");
-      assert.deepEqual(report.ingress.refusedReasons, ["ingest_backpressure:lane_queue_full"]);
-      assert.ok(report.calmLaneDrainedAtSimulatedSeconds !== null && report.calmLaneDrainedAtSimulatedSeconds < STORM_SECONDS, "calm lane drains during the storm");
-      assert.ok(report.cooldownArmedEvents > 0 && report.cooldownSeenArmed, "cool-down armed");
-      assert.equal(report.cooldownLanesAtEnd, 0, "cool-down released");
-      assert.ok(report.backpressureOutcomes > 0);
-      assert.equal(report.backpressureOutcomesWithReason, report.backpressureOutcomes, "every attempt logged with relayfileReason");
-      assert.equal(report.unwrittenAcks, 0, "zero acks of unwritten envelopes");
-      assert.equal(report.relayfileStored, 80, "zero drops: every one of the 80 deliveries reached Relayfile exactly once");
-      assert.equal(report.ingress.finalAccepted, 80);
-      assert.equal(report.dead, 0, "DLQ empty");
-      assert.equal(report.dlqArchived, 0, "DLQ archive empty");
-      assert.equal(report.relayfileRejectedSignatures, 0);
+  for (const cooldown of [true, false]) {
+    describe(`e2e: Nov 7 storm against fake Relayfile (${flavour}, cool-down ${cooldown ? "on" : "off (default)"})`, () => {
+      it("ingress sheds with reasons, other lanes unaffected, cool-down armed and released, no unwritten acks, no drops, DLQ empty", async () => {
+        const { report, file } = await runStorm(flavour, cooldown);
+        console.log(`[e2e ${flavour} cooldown=${cooldown}] report: ${file}\n${JSON.stringify({ ...report, finalStates: undefined })}`);
+        assert.ok(report.ingress.refused429 > 0, "ingress 429s once the lane cap is hit");
+        assert.deepEqual(report.ingress.refusedReasons, ["ingest_backpressure:lane_queue_full"]);
+        assert.ok(report.calmLaneDrainedAtSimulatedSeconds !== null && report.calmLaneDrainedAtSimulatedSeconds < STORM_SECONDS, "calm lane drains during the storm");
+        if (cooldown) {
+          assert.ok(report.cooldownArmedEvents > 0 && report.cooldownSeenArmed, "cool-down armed");
+        } else {
+          assert.equal(report.cooldownArmedEvents, 0, "default off: never armed");
+          assert.equal(report.cooldownSeenArmed, false);
+        }
+        assert.equal(report.cooldownLanesAtEnd, 0, "cool-down released");
+        assert.ok(report.backpressureOutcomes > 0);
+        assert.equal(report.backpressureOutcomesWithReason, report.backpressureOutcomes, "every attempt logged with relayfileReason");
+        assert.equal(report.unwrittenAcks, 0, "zero acks of unwritten envelopes");
+        assert.equal(report.relayfileStored, 80, "zero drops: every one of the 80 deliveries reached Relayfile exactly once");
+        assert.equal(report.ingress.finalAccepted, 80);
+        assert.equal(report.dead, 0, "DLQ empty");
+        assert.equal(report.dlqArchived, 0, "DLQ archive empty");
+        assert.equal(report.relayfileRejectedSignatures, 0);
+      });
     });
-  });
+  }
 }

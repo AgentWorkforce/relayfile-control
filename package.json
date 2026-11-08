@@ -15,8 +15,8 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test --test-concurrency=1 'test/**/*.test.ts'",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.cloud-port.json",
+    "test": "node --import tsx --test --test-force-exit --test-concurrency=1 'test/**/*.test.ts'",
     "start": "node dist/server.js",
     "dev": "node --import tsx src/server.ts"
   },

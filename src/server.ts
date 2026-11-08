@@ -50,7 +50,7 @@ async function main(): Promise<void> {
   let consumer: Consumer | null = null;
   let sweeper: Sweeper | null = null;
   if (config.ROLE !== "ingress") {
-    const relayfile = config.RELAYFILE_INTERNAL_HMAC_SECRET ? new RelayfileClient({ hmacSecret: config.RELAYFILE_INTERNAL_HMAC_SECRET }) : null;
+    const relayfile = config.RELAYFILE_INTERNAL_HMAC_SECRET ? new RelayfileClient({ hmacSecret: config.RELAYFILE_INTERNAL_HMAC_SECRET, retry503: config.RELAYFILE_BACKPRESSURE_RETRY_503 }) : null;
     if (!relayfile) logger.event("relayfile_not_configured", { area: "server", reason: "RELAYFILE_INTERNAL_HMAC_SECRET unset" });
     consumer = new Consumer({ db, config, logger, metrics: app.metrics, entitlement, cooldowns: app.cooldowns, relayfile });
     sweeper = new Sweeper({ db, config, logger, metrics: app.metrics, cooldowns: app.cooldowns, depth: app.depth });

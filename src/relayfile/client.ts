@@ -4,11 +4,15 @@ import {
   type RelayfileBackpressureSurface,
 } from "./backpressure.ts";
 import { signedHeaders } from "./signer.ts";
+import { ADMISSION_ATTEMPT_TIMEOUT_MS, ADMISSION_MAX_RETRIES, ADMISSION_RETRY_BUDGET_MS } from "./admission-retry.ts";
 
-/** §6.2 in-place policies. */
+/** §6.2 in-place policies, from the ported Cloud constants. */
 export type InPlacePolicy = { maxRetries: number; budgetMs: number; attemptTimeoutMs: number };
-export const ENVELOPE_ADMISSION_POLICY: InPlacePolicy = { maxRetries: 1, budgetMs: 30_000, attemptTimeoutMs: 15_000 };
-export const PROVIDER_WRITES_POLICY: InPlacePolicy = { maxRetries: 1, budgetMs: 30_000, attemptTimeoutMs: 30_000 };
+export const ENVELOPE_ADMISSION_POLICY: InPlacePolicy = {
+  maxRetries: ADMISSION_MAX_RETRIES,
+  budgetMs: ADMISSION_RETRY_BUDGET_MS,
+  attemptTimeoutMs: ADMISSION_ATTEMPT_TIMEOUT_MS,
+};
 
 /** A contract failure that must not be retried (400/401/403/413, redirect). */
 export class TerminalHandlerError extends Error {
@@ -64,6 +68,8 @@ export type RelayfileClientOptions = {
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
   now?: () => number;
+  /** RELAYFILE_BACKPRESSURE_RETRY_503 (default false). */
+  retry503?: boolean;
 };
 
 export class RelayfileClient {
@@ -94,13 +100,14 @@ export class RelayfileClient {
       ...(this.options.sleep ? { sleep: this.options.sleep } : {}),
       ...(this.options.random ? { random: this.options.random } : {}),
       ...(opts.onBackpressure ? { onBackpressure: opts.onBackpressure } : {}),
+      retry503: this.options.retry503 ?? false,
       post: () => {
         // Fresh signature and fresh per-attempt timeout on every attempt.
         const timeout = AbortSignal.timeout(policy.attemptTimeoutMs);
         const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
         return this.fetchImpl(url, {
           method: "POST",
-          headers: signedHeaders(this.options.hmacSecret, raw, body.correlationId),
+          headers: signedHeaders(this.options.hmacSecret, raw, body.correlationId, (this.options.now ?? Date.now)()),
           body: raw,
           redirect: "manual",
           signal,

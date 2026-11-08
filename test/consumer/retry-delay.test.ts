@@ -1,5 +1,5 @@
 // Ported from cloud packages/webhook-worker/test/queue-retry-delay.test.ts @ 1a59dec.
-import { describe, expect, it } from "./support/vitest-compat.ts";
+import { describe, expect, it } from "../support/vitest-compat.ts";
 import {
   FORWARD_RETRY_MAX_DELAY_SECONDS,
   FORWARD_RETRY_MIN_DELAY_SECONDS,
@@ -7,7 +7,7 @@ import {
   FORWARD_RETRY_JITTER_RATIO,
   parseForwardRetryAfterSeconds,
   resolveForwardRetryDelaySeconds,
-} from "../src/queue/retry-delay.ts";
+} from "../../src/queue/retry-delay.ts";
 
 describe("resolveForwardRetryDelaySeconds", () => {
   it.each([

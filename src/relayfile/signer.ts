@@ -10,7 +10,9 @@ let lastMs = 0;
  * `time.Parse(time.RFC3339, …)` accepts the fractional second.
  */
 export function relayTimestamp(nowMs = Date.now()): string {
-  const ms = Math.max(nowMs, lastMs + 1);
+  // Bump only when the clock has not advanced past the last stamp (same ms or a
+  // sub-second step back); an injected or genuinely later clock is used as is.
+  const ms = nowMs <= lastMs && lastMs - nowMs < 1000 ? lastMs + 1 : nowMs;
   lastMs = ms;
   return new Date(ms).toISOString();
 }

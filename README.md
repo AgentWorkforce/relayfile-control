@@ -47,6 +47,15 @@ Every setting is an environment variable with a finite default; see
 | `RELAYFILE_CONTROL_ADMIN_TOKEN` | admin bearer (comma list for rotation) |
 | `RELAYCONTROL_BASE_URL` + `RELAYCONTROL_SERVICE_TOKEN`, or `RELAYCONTROL_LICENSE_DOC` / `RELAYCONTROL_LICENSE_FILE` + `RELAYCONTROL_LICENSE_PUBLIC_KEY` | entitlement. Without the `relayfile` capability, ingress answers `403 feature_not_licensed` and the consumer pauses |
 
+Backpressure is cloud#6175 final by default. Relayfile 429 gets one in-place
+retry for long-deadline providers and none for Slack/Jira; a final 429 becomes
+a queue retry that honours Retry-After (cap 86 400 s). Opt-in switches:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `RELAYFILE_BACKPRESSURE_RETRY_503` | off | also retry 503 (as backpressure) and OSS 500 in place |
+| `COOLDOWN_ENABLED` | off | #6177 per-workspace cool-down after a final backpressure error |
+
 Secrets are never logged: the startup line reports each one only as `set` or `unset`.
 
 ## Development
@@ -59,6 +68,7 @@ RELAYFILE_CONTROL_PG_TEST_URL=postgres://… npm test   # adds the real-Postgres
 npm run build && DATABASE_URL=… MIGRATE_ON_START=1 npm start
 ```
 
-The e2e storm test writes `$TMPDIR/e2e-storm-report-{oss,cloud}.md`.
+The e2e storm test writes `$TMPDIR/e2e-storm-report-{oss,cloud}-cooldown-{on,off}.md`.
+Cloud test files ported verbatim are typechecked by `tsconfig.cloud-port.json`.
 Tests never contact a real Relayfile, Nango, Hookdeck or GitHub. All secrets
 in tests are random fixtures generated per run.

@@ -199,7 +199,7 @@ describe("ingress gates", () => {
   });
 
   it("lane_stale_cooldown: cooled lane with an old backlog is refused", async () => {
-    const t = await startApp({ config: fixtureConfig({ MAX_QUEUE_AGE_SECONDS: "1" }) });
+    const t = await startApp({ config: fixtureConfig({ MAX_QUEUE_AGE_SECONDS: "1", COOLDOWN_ENABLED: "true" }) });
     const send = () => {
       const b = JSON.stringify({ type: "forward", from: "notion", connectionId: "cool", payload: { r: Math.random() } });
       return t.post("/api/v1/webhooks/nango", b, sign.nango(b));

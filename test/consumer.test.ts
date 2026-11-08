@@ -14,7 +14,7 @@ import { RelayfileClient } from "../src/relayfile/client.ts";
 import { envelope } from "./support/fixtures.ts";
 import { fakeRelayfile, FIXTURE, fixtureConfig, makeVisible, newPglite, type FakeResponse } from "./support/harness.ts";
 
-async function setup(respond?: (n: number) => FakeResponse, cfg: Partial<Record<keyof Config, string>> = {}, extra: { deadlineMs?: (p: string) => number; maxBodyBytes?: number } = {}) {
+async function setup(respond?: (n: number) => FakeResponse, cfg: Partial<Record<keyof Config, string>> = {}, extra: { deadlineMs?: (p: string) => number; maxBodyBytes?: number; retry503?: boolean } = {}) {
   const db = await newPglite();
   const fake = await fakeRelayfile({ ...(respond ? { respond: (_r, n) => respond(n) } : {}), ...(extra.maxBodyBytes ? { maxBodyBytes: extra.maxBodyBytes } : {}) });
   const config = fixtureConfig({ RELAYFILE_BASE_URL: fake.url, ...cfg });
@@ -22,7 +22,7 @@ async function setup(respond?: (n: number) => FakeResponse, cfg: Partial<Record<
   const metrics = new Metrics();
   const entitlement = new StaticEntitlement(true);
   const cooldowns = new CooldownStore(db, { enabled: config.COOLDOWN_ENABLED, maxKeys: 100 });
-  const relayfile = new RelayfileClient({ hmacSecret: FIXTURE.relayHmac, sleep: async () => undefined });
+  const relayfile = new RelayfileClient({ hmacSecret: FIXTURE.relayHmac, sleep: async () => undefined, retry503: extra.retry503 ?? false });
   const consumer = new Consumer({ db, config, logger, metrics, entitlement, cooldowns, relayfile, random: () => 0, ...(extra.deadlineMs ? { deadlineMs: extra.deadlineMs } : {}) });
   await upsertBinding(db, { workspaceId: "rw_a", provider: "github", connectionId: "gh-a", nativeIds: { installation_id: "1" } });
   return { db, fake, config, logger, metrics, entitlement, cooldowns, consumer, close: async () => { await fake.close(); await db.close(); } };
@@ -80,7 +80,7 @@ describe("consumer → fake Relayfile (§4.4, §6)", () => {
   });
 
   it("HARD: 429 forever ⇒ maxRetries+1 posts per attempt, lengthening queue delays, cool-down, then DLQ with the full reason chain", async () => {
-    const s = await setup(() => ({ status: 429, headers: { "retry-after": "7" }, body: { reason: "workspace_busy" } }), { MAX_ATTEMPTS: "3" });
+    const s = await setup(() => ({ status: 429, headers: { "retry-after": "7" }, body: { reason: "workspace_busy" } }), { MAX_ATTEMPTS: "3", COOLDOWN_ENABLED: "true" });
     await insertEnvelope(s.db, ghRow());
     const delays: number[] = [];
     for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -100,6 +100,7 @@ describe("consumer → fake Relayfile (§4.4, §6)", () => {
           relayfileReason: "workspace_busy",
           retryAfterSeconds: 7,
           inPlaceAttempts: 2,
+          cooldownArmedSeconds: 7,
           attempts: attempt,
           retryDelaySeconds: undefined,
         },
@@ -117,13 +118,45 @@ describe("consumer → fake Relayfile (§4.4, §6)", () => {
   });
 
   it("no Retry-After ⇒ retryAfterSeconds defaults to 60 (HARD)", async () => {
-    const s = await setup(() => ({ status: 503, body: { reason: "storage_full" } }));
+    const s = await setup(() => ({ status: 429, body: { reason: "queue_full" } }));
     await insertEnvelope(s.db, ghRow());
     await s.consumer.drain();
     const row = await only<{ last_outcome: any }>(s.db, "SELECT last_outcome FROM webhook_envelopes");
     assert.equal(row.last_outcome.retryAfterSeconds, 60);
-    assert.equal(row.last_outcome.status, 503);
-    assert.equal(row.last_outcome.relayfileReason, "storage_full");
+    assert.equal(row.last_outcome.status, 429);
+    assert.equal(row.last_outcome.relayfileReason, "queue_full");
+    await s.close();
+  });
+
+  it("cool-down is default off: a final 429 retries but arms nothing", async () => {
+    const s = await setup(() => ({ status: 429, headers: { "retry-after": "7" } }));
+    await insertEnvelope(s.db, ghRow());
+    await s.consumer.drain();
+    const row = await only<{ state: string; last_outcome: any }>(s.db, "SELECT state, last_outcome FROM webhook_envelopes");
+    assert.deepEqual([row.state, row.last_outcome.code, row.last_outcome.cooldownArmedSeconds], ["queued", "relayfile_backpressure", undefined]);
+    assert.equal((await s.db.query("SELECT 1 FROM lane_cooldowns")).rows.length, 0);
+    await s.close();
+  });
+
+  it("503 by default (RELAYFILE_BACKPRESSURE_RETRY_503 off): one post, retry on the schedule, no cool-down", async () => {
+    const s = await setup(() => ({ status: 503, headers: { "retry-after": "30" }, body: { reason: "storage_full" } }), { COOLDOWN_ENABLED: "true" });
+    await insertEnvelope(s.db, ghRow());
+    await s.consumer.drain();
+    assert.equal(s.fake.requests.length, 1, "no in-place retry of 503 by default");
+    const row = await only<{ state: string; last_outcome: any }>(s.db, "SELECT state, last_outcome FROM webhook_envelopes");
+    assert.deepEqual([row.state, row.last_outcome.code, row.last_outcome.status], ["queued", "relayfile_server_error", 503]);
+    assert.equal(row.last_outcome.retryAfterSeconds, undefined);
+    assert.equal(await s.cooldowns.remaining("rw_a"), 0);
+    await s.close();
+  });
+
+  it("503 with RELAYFILE_BACKPRESSURE_RETRY_503: retried in place, then backpressure honouring Retry-After", async () => {
+    const s = await setup(() => ({ status: 503, headers: { "retry-after": "2" }, body: { reason: "storage_full" } }), {}, { retry503: true });
+    await insertEnvelope(s.db, ghRow());
+    await s.consumer.drain();
+    assert.equal(s.fake.requests.length, 2);
+    const row = await only<{ last_outcome: any }>(s.db, "SELECT last_outcome FROM webhook_envelopes");
+    assert.deepEqual([row.last_outcome.code, row.last_outcome.retryAfterSeconds, row.last_outcome.relayfileReason], ["relayfile_backpressure", 2, "storage_full"]);
     await s.close();
   });
 

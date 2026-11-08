@@ -5,12 +5,13 @@ import { ulid } from "../envelope/ulid.ts";
 import type { Entitlement } from "../entitlement/entitlement.ts";
 import { laneHash, type Logger } from "../observability/log.ts";
 import type { Metrics } from "../observability/metrics.ts";
-import { cooldownWindowSeconds, type CooldownStore } from "../queue/cooldown.ts";
+import { backpressureCooldownSeconds, type CooldownStore } from "../queue/cooldown.ts";
 import { resolveForwardRetryDelaySeconds } from "../queue/retry-delay.ts";
 import { claimNext, fanOut, heartbeat, markDead, markDone, markRetry } from "../queue/store.ts";
-import { RelayfileBackpressureError, RelayfileServerError } from "../relayfile/backpressure.ts";
+import { type RelayfileBackpressureError, RelayfileServerError } from "../relayfile/backpressure.ts";
 import { type RelayfileClient, RelayfileUnexpectedStatusError, TerminalHandlerError } from "../relayfile/client.ts";
 import { type EnvelopeHandler, forwardEnvelope, RetryableHandlerError } from "./envelope-handler.ts";
+import { backpressureRetryAfterSeconds, detectRelayfileBackpressure } from "./failure.ts";
 import { handlerDeadlineMs } from "./policy.ts";
 
 export class HandlerTimeoutError extends Error {
@@ -177,20 +178,24 @@ export class Consumer {
 
     let retryAfterSeconds: number | null = null;
     let fields: Record<string, unknown>;
-    if (error instanceof RelayfileBackpressureError) {
+    const backpressure = detectRelayfileBackpressure(error);
+    if (backpressure) {
       // HARD: max(1, ceil(retryAfterMs/1000)) or default 60; never an ack, never a drop.
-      retryAfterSeconds = error.retryAfterMs !== null ? Math.max(1, Math.ceil(error.retryAfterMs / 1000)) : 60;
+      retryAfterSeconds = backpressureRetryAfterSeconds(backpressure.retryAfterMs);
+      const src = backpressure.source as Partial<RelayfileBackpressureError>;
       fields = {
         code: "relayfile_backpressure",
-        status: error.status,
-        surface: error.surface,
-        relayfileReason: error.relayfileReason,
+        status: src.status,
+        surface: src.surface,
+        relayfileReason: src.relayfileReason ?? null,
         retryAfterSeconds,
-        inPlaceAttempts: error.attempts,
+        inPlaceAttempts: src.attempts,
       };
-      if (this.deps.cooldowns.enabled) {
-        const window = cooldownWindowSeconds({ retryAfterMs: error.retryAfterMs });
-        const remaining = await this.deps.cooldowns.arm(lane, window, worker, error.relayfileReason ?? `status_${error.status}`);
+      // #6177 arming contract: only a final backpressure error arms (never 5xx/timeouts/network).
+      const window = backpressureCooldownSeconds(error);
+      if (this.deps.cooldowns.enabled && window !== null) {
+        const remaining = await this.deps.cooldowns.arm(lane, window, worker, src.relayfileReason ?? `status_${src.status ?? "unknown"}`);
+        fields.cooldownArmedSeconds = window;
         this.deps.metrics.inc("cooldown_armed_total", { provider: row.provider.split("-")[0] ?? row.provider });
         this.deps.logger.event("cooldown_armed", { area: "consumer", laneHash: laneHash(lane), provider: row.provider, armedSeconds: window, cooldownRemainingSeconds: remaining });
       }
