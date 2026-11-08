@@ -201,16 +201,25 @@ Two levels, both in Postgres (Cloud's Notion claim was in-memory — **FIX**):
    tuple, `google-mail-forward-sync` / `google-mail-forward-trailing-sync` with
    TTL coalescing, `notion` keyed by `did:<id>` or the entity tuple, `jira`,
    `linear`). Claim = atomic
-   `INSERT … ON CONFLICT (surface, dedupe_id) DO UPDATE SET status='processing', lease_until=now()+lease WHERE claims.status='failed' OR claims.lease_until < now() RETURNING`;
-   no row returned ⇒ already claimed/completed ⇒ handler returns `duplicate`
-   (acked). Lease 15 min (`CLAIM_LEASE_SECONDS`). `completed` only on handler
-   success; `failed` on handler failure (release); a crashed worker's lease
+   `INSERT … ON CONFLICT (surface, dedupe_id) DO UPDATE SET status='processing', lease_until=now()+lease, attempts=attempts+1 WHERE claims.status='failed' OR (claims.status='processing' AND claims.lease_until < now()) RETURNING attempts`;
+   the expired-lease branch is limited to `processing` rows so a `completed`
+   row is a duplicate whatever `lease_until` it carries. No row returned ⇒
+   read the row back: `completed` (or purged) ⇒ handler returns `duplicate`
+   (acked); anything else (`processing` under a live lease, or a row that
+   moved to `failed` between the upsert and the read-back) ⇒ in flight ⇒
+   retryable `claim_in_flight`, never acked, because the holder may crash
+   mid-delivery. Lease 15 min (`CLAIM_LEASE_SECONDS`). `completed` only on
+   handler success; `failed` on handler failure (release); both are fenced on
+   the `attempts` value the claim returned, so a late handler whose lease was
+   reclaimed cannot complete or release the newer claim (the fenced-out
+   result is logged, not treated as success); a crashed worker's lease
    expires. Google-mail TTL coalescing: a `completed` row younger than
    `GMAIL_SYNC_COALESCE_SECONDS` is treated as a duplicate (Cloud behaviour).
 
 Both levels share one implementation (`src/queue/claims.ts`) with tests for:
 concurrent claim race (real PG), expired-lease takeover, failed→reclaim,
-completed→duplicate, TTL coalescing.
+completed→duplicate (also with a stale `lease_until`), in-flight→retry,
+fenced completion/failure, TTL coalescing.
 
 ## 4. Queue and consumer
 
