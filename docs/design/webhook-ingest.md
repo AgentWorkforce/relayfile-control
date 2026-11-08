@@ -621,7 +621,9 @@ runbook. Each PR is a draft until Khaliq un-drafts; Khaliq merges.
    event type WITH a path throws (retry then DLQ), no path is silently
    ignored; cloud-only extras `provider_event_type`, `resource_ref`,
    `resource_refs` are honoured there and ignored by OSS.
-   Dedupe key is `(workspaceId, provider, deliveryId)`, NOT envelopeId:
+   Dedupe key is `(workspaceId, provider, deliveryId)`, NOT envelopeId;
+   HARD: envelopeId is always derived WITH deliveryId (OSS main does not
+   detect envelopeId collisions between deliveries):
    retries MUST keep deliveryId stable (§6.1). Headers are a string→string
    map. OSS 413 is on the whole envelope body (RELAYFILE_MAX_BODY_BYTES,
    default 1 MiB), terminal. OSS 500 (generic store error, no Retry-After)
