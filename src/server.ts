@@ -8,6 +8,7 @@ import { migrate } from "./db/migrate.ts";
 import { RefreshingEntitlement } from "./entitlement/entitlement.ts";
 import { jsonLogger } from "./observability/log.ts";
 import { RelayfileClient } from "./relayfile/client.ts";
+import { buildFlows } from "./flows/wiring.ts";
 
 async function main(): Promise<void> {
   const logger = jsonLogger();
@@ -36,7 +37,10 @@ async function main(): Promise<void> {
   await logEntitlement();
   const entitlementTimer = setInterval(() => void logEntitlement().catch(() => undefined), config.ENTITLEMENT_REFRESH_SECONDS * 1000);
 
-  const app = createApp({ config, db, logger, entitlement });
+  // Flows serve on the public listener of every role (README "Flows API").
+  const flows = config.FLOWS_ENABLED ? buildFlows(config, db, logger) : null;
+  const app = createApp({ config, db, logger, entitlement, ...(flows ? { flows: flows.deps } : {}) });
+  flows?.outbox.start();
   const servers: Server[] = [];
   const listen = (handler: Parameters<typeof createServer>[1], address: string, name: string) => {
     const { host, port } = parseListen(address);
@@ -65,6 +69,7 @@ async function main(): Promise<void> {
     sweeper?.stop();
     await Promise.all(servers.map((s) => new Promise<void>((resolve) => s.close(() => resolve()))));
     await consumer?.stop();
+    await flows?.outbox.stop();
     await db.close();
     process.exit(0);
   };

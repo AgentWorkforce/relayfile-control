@@ -8,6 +8,14 @@ info:
     /readyz. Internal listener (ADMIN_LISTEN): /metrics and /api/v1/admin/*.
     Every webhook response carries `x-relayfile-control-request-id`.
     `/cloud/api/v1/webhooks/*` aliases every webhook route.
+
+    Flows API (README "Flows API"): the Relayflows routes below are served
+    here with relay-control's contract unchanged; the ingress routes
+    /api/v1/flows, /api/v1/workers and /api/v1/workflows (and their
+    `/cloud/api/v1/*` aliases) to this service. User access tokens are
+    verified through relay-control introspection. Flows operations carry
+    `security` explicitly because this document has no global default
+    (relay-control's applied bearerAuth globally).
 servers:
   - url: https://relayfile-control.example.invalid
 paths:
@@ -189,12 +197,1024 @@ paths:
       summary: Resume ingress
       security: [{ admin: [] }]
       responses: { "200": { description: "Resumed" } }
+  # --- Relayflows (src/flows). Dashboard calls use the caller's current workspace.
+  /api/v1/workers/enrollment-tokens:
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [workers]
+      operationId: listWorkerEnrollmentTokens
+      description: Workspace owner/admin. Tokens are never returned after creation; only a hint.
+      responses:
+        "200":
+          description: Recent enrollment tokens
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tokens]
+                properties:
+                  tokens:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/EnrollmentTokenSummary"
+        "403":
+          description: Workspace admin role required
+    post:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [workers]
+      operationId: createWorkerEnrollmentToken
+      description: |
+        Workspace owner/admin. Mints a single-use enrollment token (stored as a
+        SHA-256 hash) for `agent-relay cloud worker register`. The plaintext
+        token is returned only in this response.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                workspaceId:
+                  type: string
+                  format: uuid
+                name:
+                  type: string
+                  maxLength: 128
+                tags:
+                  type: array
+                  items:
+                    type: string
+                expiresInMinutes:
+                  type: integer
+                  minimum: 1
+                  maximum: 10080
+      responses:
+        "200":
+          description: Token issued (Cache-Control no-store)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, token, expiresAt, createdAt, cloudUrl, registerCommand, startCommand]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  token:
+                    type: string
+                    pattern: "^sh_wrk_enr_"
+                  expiresAt:
+                    type: string
+                    format: date-time
+                  createdAt:
+                    type: string
+                    format: date-time
+                  cloudUrl:
+                    type: string
+                    format: uri
+                  registerCommand:
+                    type: string
+                  startCommand:
+                    type: string
+        "403":
+          description: Workspace admin role required
+  /api/v1/workers/enrollment-tokens/{tokenId}:
+    delete:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [workers]
+      operationId: revokeWorkerEnrollmentToken
+      parameters:
+        - name: tokenId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Revoked
+        "404":
+          description: Unknown, used, or already revoked
+  /api/v1/workers:
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [workers]
+      operationId: listWorkers
+      responses:
+        "200":
+          description: Workers in the current workspace
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [workers]
+                properties:
+                  workers:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Worker"
+  /api/v1/workers/{workerId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkerId"
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [workers]
+      operationId: getWorker
+      responses:
+        "200":
+          description: Worker
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [worker]
+                properties:
+                  worker:
+                    $ref: "#/components/schemas/Worker"
+        "404":
+          description: Not in this workspace
+    delete:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [workers]
+      operationId: revokeWorker
+      description: Workspace owner/admin. Revokes the worker token, fails its active work, and sends `revoke` on its queue stream.
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [workerId, status]
+                properties:
+                  workerId:
+                    type: string
+                    format: uuid
+                  status:
+                    const: revoked
+  /api/v1/workers/register:
+    post:
+      tags: [worker-protocol]
+      operationId: registerWorker
+      security: []
+      description: Called by `agent-relay cloud worker register`. Consumes the enrollment token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enrollmentToken, name]
+              properties:
+                enrollmentToken:
+                  type: string
+                name:
+                  type: string
+                  maxLength: 128
+                hostInfo:
+                  type: object
+      responses:
+        "200":
+          description: Registered
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [workerId, workerToken, heartbeatIntervalMs]
+                properties:
+                  workerId:
+                    type: string
+                    format: uuid
+                  workerToken:
+                    type: string
+                    pattern: "^sh_wrk_"
+                  heartbeatIntervalMs:
+                    type: integer
+        "401":
+          description: Invalid, used, revoked, or expired enrollment token
+        "409":
+          description: Worker name already exists in the workspace
+  /api/v1/workers/{workerId}/heartbeat:
+    parameters:
+      - $ref: "#/components/parameters/WorkerId"
+    post:
+      tags: [worker-protocol]
+      operationId: workerHeartbeat
+      security:
+        - workerToken: []
+      responses:
+        "200":
+          description: Recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, nextHeartbeatMs]
+                properties:
+                  ok:
+                    const: true
+                  nextHeartbeatMs:
+                    type: integer
+        "401":
+          description: Invalid or revoked worker token
+  /api/v1/workers/{workerId}/queue:
+    parameters:
+      - $ref: "#/components/parameters/WorkerId"
+    get:
+      tags: [worker-protocol]
+      operationId: workerQueue
+      security:
+        - workerToken: []
+      description: |
+        Server-sent events. `event: ping` (data `{}`) on connect and every
+        SELFHOST_FLOWS_QUEUE_PING_MS; `event: assignment` (data
+        WorkAssignment); `event: revoke` then close. Assigned but
+        unacknowledged work is redelivered on reconnect. A worker holds at
+        most one assigned/running assignment at a time.
+      responses:
+        "200":
+          description: Event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /api/v1/workers/{workerId}/assignments/{runId}/ack:
+    parameters:
+      - $ref: "#/components/parameters/WorkerId"
+      - $ref: "#/components/parameters/RunId"
+    post:
+      tags: [worker-protocol]
+      operationId: ackAssignment
+      security:
+        - workerToken: []
+      responses:
+        "200":
+          description: Acknowledged (idempotent)
+        "404":
+          description: Not assigned to this worker
+        "409":
+          description: The run was cancelled before acknowledgement
+  /api/v1/workers/{workerId}/assignments/{runId}/status:
+    parameters:
+      - $ref: "#/components/parameters/WorkerId"
+      - $ref: "#/components/parameters/RunId"
+    post:
+      tags: [worker-protocol]
+      operationId: reportAssignmentStatus
+      security:
+        - workerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phase]
+              properties:
+                phase:
+                  enum: [running, completed, failed]
+                exitCode:
+                  type: integer
+                durationMs:
+                  type: integer
+                summary:
+                  type: string
+                error:
+                  type: string
+                result:
+                  type: object
+      responses:
+        "200":
+          description: Recorded; reports after a terminal state are returned unchanged
+        "404":
+          description: Not assigned to this worker
+  /api/v1/workers/{workerId}/assignments/{runId}/cli-credentials:
+    parameters:
+      - $ref: "#/components/parameters/WorkerId"
+      - $ref: "#/components/parameters/RunId"
+      - $ref: "#/components/parameters/CliCredentialRef"
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      operationId: workerReadCliCredentials
+      description: |
+        The assigned worker (worker bearer token) plus the run's short-lived
+        reference from the assignment payload (`cliCredentials.ref`, header
+        X-Cli-Credential-Ref). Returns each selected subscription login as the
+        auth file its CLI reads (Codex `$CODEX_HOME/auth.json`, Grok
+        `$GROK_HOME/auth.json`), refreshed first when it expires within 45
+        minutes. The reference is revoked when the run finishes. The worker
+        writes the files 0600 into the run's private directory and deletes them
+        with it; it never logs them.
+      responses:
+        "200":
+          description: Auth files for the run
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  files:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        credentialId: { type: string, format: uuid }
+                        provider: { enum: [openai, xai] }
+                        cli: { enum: [codex, grok] }
+                        homeEnv: { enum: [CODEX_HOME, GROK_HOME] }
+                        directory: { type: string }
+                        file: { type: string }
+                        content: { type: string, description: "Secret. The auth file JSON." }
+                  skipped:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        credentialId: { type: string }
+                        reason: { type: string }
+        "401": { description: Missing or invalid worker token or reference }
+        "404": { description: Not this worker's active assignment }
+  /api/v1/workers/{workerId}/assignments/{runId}/cli-credentials/{credentialId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkerId"
+      - $ref: "#/components/parameters/RunId"
+      - $ref: "#/components/parameters/CliCredentialRef"
+      - name: credentialId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    put:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      operationId: workerWriteBackCliCredential
+      description: |
+        Write-back after a run when the CLI refreshed its own tokens. Accepted
+        only for a login the reference covers, for the same provider account,
+        and never over a newer stored login.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string, writeOnly: true }
+      responses:
+        "200":
+          description: Stored (updated) or unchanged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updated: { type: boolean }
+        "409": { description: Auth file belongs to a different account }
+        "422": { description: Not a valid auth file for the provider }
+  /api/v1/workers/{workerId}/assignments/{runId}/storage/{objectKey}:
+    parameters:
+      - $ref: "#/components/parameters/WorkerId"
+      - $ref: "#/components/parameters/RunId"
+      - $ref: "#/components/parameters/ObjectKey"
+    get:
+      tags: [worker-protocol]
+      operationId: getAssignmentObject
+      security:
+        - workerToken: []
+      description: Readable while the assignment is assigned or running (for example `code.tar.gz`).
+      responses:
+        "200":
+          description: Object bytes
+        "404":
+          description: Unknown object or assignment
+    head:
+      tags: [worker-protocol]
+      operationId: headAssignmentObject
+      security:
+        - workerToken: []
+      responses:
+        "200":
+          description: Exists
+        "404":
+          description: Missing
+    put:
+      tags: [worker-protocol]
+      operationId: putAssignmentObject
+      security:
+        - workerToken: []
+      description: Upload a log or artifact (max 8 MiB). `code.tar.gz` is read-only.
+      requestBody:
+        content:
+          application/octet-stream: {}
+      responses:
+        "200":
+          description: Stored
+  /api/v1/flows:
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [flows]
+      operationId: listFlows
+      responses:
+        "200":
+          description: Flow definitions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [flows]
+                properties:
+                  flows:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Flow"
+    post:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [flows]
+      operationId: createFlow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FlowInput"
+      responses:
+        "201":
+          description: Created
+        "409":
+          description: Name already used in the workspace
+  /api/v1/flows/{flowId}:
+    parameters:
+      - $ref: "#/components/parameters/FlowId"
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [flows]
+      operationId: getFlow
+      responses:
+        "200":
+          description: Flow with source, declared steps, and its 20 most recent runs
+    patch:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [flows]
+      operationId: updateFlow
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FlowInput"
+      responses:
+        "200":
+          description: Updated
+    delete:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [flows]
+      operationId: deleteFlow
+      responses:
+        "200":
+          description: Deleted (existing runs are kept)
+  /api/v1/flows/{flowId}/invoke:
+    parameters:
+      - $ref: "#/components/parameters/FlowId"
+    post:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [flows]
+      operationId: invokeFlow
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunOptions"
+      responses:
+        "201":
+          description: Run queued for a worker
+  /api/v1/workflows/run:
+    post:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [runs]
+      operationId: createRun
+      description: Queue an ad-hoc workflow (or `flowId`) for a worker. `resume` re-queues a finished run.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/RunOptions"
+                - type: object
+                  properties:
+                    workflow:
+                      type: string
+                    fileType:
+                      enum: [yaml, ts]
+                    name:
+                      type: string
+                    workflowFileName:
+                      type: string
+                    flowId:
+                      type: string
+                      format: uuid
+                    resume:
+                      type: string
+                      format: uuid
+                    startFrom:
+                      type: string
+                    codeArchiveBase64:
+                      type: string
+                      description: gzip tarball served to the worker as `s3CodeKey` `code.tar.gz`
+      responses:
+        "201":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runId, status]
+                properties:
+                  runId:
+                    type: string
+                    format: uuid
+                  status:
+                    const: pending
+                  assignmentId:
+                    type: string
+                  dispatchedTo:
+                    type: [string, "null"]
+        "400":
+          description: Invalid body, or a runtime other than `worker`
+        "404":
+          description: Requested worker or flow not found
+  /api/v1/workflows/runs:
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [runs]
+      operationId: listRuns
+      parameters:
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            maximum: 100
+        - name: flowId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/RunStatus"
+      responses:
+        "200":
+          description: Newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs, nextCursor, totalRuns, activeRuns, failedRuns]
+                properties:
+                  runs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Run"
+                  nextCursor:
+                    type: [string, "null"]
+                  totalRuns:
+                    type: integer
+                  activeRuns:
+                    type: integer
+                  failedRuns:
+                    type: integer
+                  needsReviewRuns:
+                    type: integer
+  /api/v1/workflows/runs/{runId}:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [runs]
+      operationId: getRun
+      responses:
+        "200":
+          description: Run
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "404":
+          description: Not in this workspace
+  /api/v1/workflows/runs/{runId}/workflow:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [runs]
+      operationId: getRunWorkflow
+      responses:
+        "200":
+          description: The exact definition the run executed
+  /api/v1/workflows/runs/{runId}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    post:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [runs]
+      operationId: cancelRun
+      description: |
+        Withdraws queued work immediately. Work already on a worker cannot be
+        interrupted over the assignment protocol; the run is marked cancelled
+        and the worker's later report does not change it.
+      responses:
+        "200":
+          description: Cancelled
+        "409":
+          description: Run already finished
+  /api/v1/workflows/runs/{runId}/resume:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    post:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [runs]
+      operationId: resumeRun
+      description: Re-queue a finished worker run as a new linked run, optionally from `startFrom`.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                startFrom:
+                  type: string
+                workerId:
+                  type: string
+                  format: uuid
+      responses:
+        "201":
+          description: New run queued
+        "409":
+          description: Run not finished, or a locally mirrored run
+  /api/v1/workflows/runs/{runId}/retry:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    post:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [runs]
+      operationId: retryRun
+      responses:
+        "201":
+          description: New run queued from the start
+  /api/v1/workflows/runs/{runId}/steps:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [runs]
+      operationId: listRunSteps
+      description: |
+        `source: reported` when the runtime mirrored steps; otherwise
+        `declared` steps parsed from the YAML definition with a status
+        inferred from the run (`completed`, `pending`, or `unknown`).
+      responses:
+        "200":
+          description: Steps
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [steps, source, live]
+                properties:
+                  source:
+                    enum: [reported, declared, none]
+                  live:
+                    type: boolean
+                  steps:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Step"
+    post:
+      tags: [run-ingestion]
+      operationId: reportFinalSteps
+      security:
+        - runToken: []
+      description: v2 cloud-mirror final step report; replaces all step rows.
+      responses:
+        "201":
+          description: Stored
+  /api/v1/workflows/runs/{runId}/steps/snapshot:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    post:
+      tags: [run-ingestion]
+      operationId: reportStepSnapshot
+      security:
+        - runToken: []
+      responses:
+        "202":
+          description: Accepted
+        "409":
+          description: Run already finished
+  /api/v1/workflows/runs/{runId}/events:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [runs]
+      operationId: listRunEvents
+      parameters:
+        - name: after
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            maximum: 1000
+        - name: sort
+          in: query
+          schema:
+            enum: [asc, desc]
+      responses:
+        "200":
+          description: Control-plane lifecycle events (run.queued, run.assigned, run.acknowledged, run.running, run.completed|failed|cancelled) plus mirrored runtime events
+    post:
+      tags: [run-ingestion]
+      operationId: appendRunEvent
+      security:
+        - runToken: []
+      responses:
+        "201":
+          description: Appended with the next per-run sequence
+  /api/v1/workflows/runs/{runId}/storage/{objectKey}:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+      - $ref: "#/components/parameters/ObjectKey"
+    put:
+      tags: [run-ingestion]
+      operationId: putRunObject
+      security:
+        - runToken: []
+      description: Upload `runner.log`, `<step>/agent.log`, or an artifact. Honors `If-None-Match "*"`.
+      responses:
+        "200":
+          description: Stored
+        "412":
+          description: Object exists and If-None-Match was "*"
+  /api/v1/workflows/runs/{runId}/logs:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [runs]
+      operationId: readRunLog
+      parameters:
+        - name: offset
+          in: query
+          schema:
+            type: integer
+        - name: file
+          in: query
+          schema:
+            type: string
+            default: runner.log
+        - name: step
+          in: query
+          description: Reads `<step>/agent.log` instead of `file`
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Incremental log page (256 KiB max)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [content, offset, totalSize, done, available]
+                properties:
+                  content:
+                    type: string
+                  offset:
+                    type: integer
+                  totalSize:
+                    type: integer
+                  done:
+                    type: boolean
+                  available:
+                    type: boolean
+                  reset:
+                    type: boolean
+  /api/v1/workflows/runs/{runId}/artifacts:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [runs]
+      operationId: listRunArtifacts
+      responses:
+        "200":
+          description: Stored objects with kind log, code, or artifact
+  /api/v1/workflows/runs/{runId}/artifacts/{objectKey}:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+      - $ref: "#/components/parameters/ObjectKey"
+    get:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [runs]
+      operationId: downloadRunArtifact
+      description: Served as an attachment with nosniff and a sandbox CSP.
+      responses:
+        "200":
+          description: Object bytes
+  /api/v1/workflows/local-run:
+    post:
+      security: [{ bearerAuth: [] }, { cookieAuth: [] }]
+      tags: [run-ingestion]
+      operationId: registerLocalRun
+      description: |
+        v2 cloud-mirror registration (`flows run` with FLOWS_CLOUD_URL /
+        FLOWS_CLOUD_TOKEN). Returns a run-bound ingestion token and callback
+        token; both are stored hashed and never returned again.
+      responses:
+        "201":
+          description: Local run registered
+  /api/v1/workflows/callback:
+    post:
+      tags: [run-ingestion]
+      operationId: runCallback
+      security:
+        - runToken: []
+      description: Terminal status for a mirrored run. `callbackToken` must match.
+      responses:
+        "200":
+          description: Recorded
+        "401":
+          description: Invalid run or callback token
+        "409":
+  /internal/v1/telemetry/flows:
+    get:
+      summary: Installation-wide Flows counts for relay-control telemetry
+      description: |
+        Authenticated by RELAYFILE_CONTROL_TELEMETRY_SECRET (constant-time
+        compare). 404 when the secret is not configured. No workspace ids,
+        names or bodies.
+      security: [{ telemetrySecret: [] }]
+      responses:
+        "200":
+          description: Counts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs_by_status, workers_by_status, flow_definitions]
+                properties:
+                  runs_by_status: { type: object, additionalProperties: { type: integer } }
+                  workers_by_status: { type: object, additionalProperties: { type: integer } }
+                  flow_definitions: { type: integer }
+        "401": { description: "unauthorized (missing or wrong secret)" }
+        "404": { description: "not_found (RELAYFILE_CONTROL_TELEMETRY_SECRET unset)" }
+  /internal/v1/flows/runtime-credentials/verify:
+    post:
+      summary: Verify a worker credential for relay-control's runtime-environment route
+      description: |
+        Authenticated by RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET (constant-time
+        compare). 404 when the secret is not configured or Flows are off
+        (FLOWS_ENABLED unset); the caller treats a 404 as nothing to do. The
+        credential is never echoed or logged.
+      security: [{ runtimeVerifySecret: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string, description: "a worker credential (`sh_wrk_`)" }
+      responses:
+        "200":
+          description: "`active: true` with the worker's subject, workspace and scopes for a live worker credential; otherwise `{active: false}`"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [active]
+                properties:
+                  active: { type: boolean }
+                  subject: { type: string, example: "worker:00000000-0000-0000-0000-000000000000" }
+                  workspaceId: { type: string, format: uuid }
+                  scopes: { type: array, items: { type: string } }
+        "400": { description: "invalid_request (missing token or malformed body)" }
+        "401": { description: "unauthorized (missing or wrong secret)" }
+        "404": { description: "not_found (RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET unset, or FLOWS_ENABLED off); the caller treats it as nothing to do" }
+        "405": { description: "method_not_allowed" }
+  /internal/v1/flows/workspaces/{workspaceId}:
+    delete:
+      summary: Delete a workspace's Flows data
+      description: |
+        Called by relay-control when it deletes a workspace. Authenticated by
+        RELAYFILE_CONTROL_BROKER_SECRET (constant-time compare); 404 when it
+        is not configured or Flows are off (FLOWS_ENABLED unset), which the
+        caller treats as nothing to do. Deletes flows, runs (with secrets, events, steps,
+        assignments and stored objects), workers and enrollment tokens, and
+        queues CLI-credential revocations for the runs, in one transaction.
+        Idempotent: a repeat answers 200 with zero counts. With GCS storage
+        the bucket objects are left behind.
+      security: [{ brokerSecret: [] }]
+      parameters:
+        - { name: workspaceId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Counts deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [workspaceId, deleted]
+                properties:
+                  workspaceId: { type: string, format: uuid }
+                  deleted:
+                    type: object
+                    required: [flows, runs, workers, enrollmentTokens, revocationsQueued]
+                    properties:
+                      flows: { type: integer }
+                      runs: { type: integer }
+                      workers: { type: integer }
+                      enrollmentTokens: { type: integer }
+                      revocationsQueued: { type: integer }
+        "400": { description: "invalid_request (workspace id is not a UUID)" }
+        "401": { description: "unauthorized (missing or wrong secret)" }
+        "404": { description: "not_found (RELAYFILE_CONTROL_BROKER_SECRET unset, or FLOWS_ENABLED off); the caller treats it as nothing to do" }
+        "405": { description: "method_not_allowed" }
 components:
   securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: relay-control user access token (`sh_at_`), verified through relay-control POST /internal/v1/auth/introspect. When relay-control cannot be asked the route answers 503 `auth_unavailable`.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: agent_relay_session
+      description: "relay-control's session cookie; accepted only under `/cloud/api/v1/*`. A cookie-authenticated request other than GET must be `application/json` with an allowed `Origin` (or `Sec-Fetch-Site` same-origin), else 403 `csrf_rejected`."
+    workerToken:
+      type: http
+      scheme: bearer
+      description: Durable `sh_wrk_` token from /api/v1/workers/register, scoped to one worker.
+    runToken:
+      type: http
+      scheme: bearer
+      description: Run-bound `sh_run_` ingestion token from /api/v1/workflows/local-run.
+    telemetrySecret:
+      type: http
+      scheme: bearer
+      description: RELAYFILE_CONTROL_TELEMETRY_SECRET, sent by relay-control.
+    runtimeVerifySecret:
+      type: http
+      scheme: bearer
+      description: RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET, sent by relay-control.
+    brokerSecret:
+      type: http
+      scheme: bearer
+      description: RELAYFILE_CONTROL_BROKER_SECRET, sent by relay-control.
     admin:
       type: http
       scheme: bearer
       description: RELAYFILE_CONTROL_ADMIN_TOKEN (comma list for rotation), constant-time compare.
+  parameters:
+    CliCredentialRef:
+      name: X-Cli-Credential-Ref
+      in: header
+      required: true
+      schema: { type: string }
+      description: The run's short-lived reference from the assignment payload (`cliCredentials.ref`).
+    WorkerId:
+      name: workerId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    FlowId:
+      name: flowId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ObjectKey:
+      name: objectKey
+      in: path
+      required: true
+      description: Slash-separated key; no empty, `.`, or `..` segments.
+      schema:
+        type: string
   responses:
     Ingress202: { description: "Accepted (durable), dropped (Nango without provider id) or ignored (unknown GitHub installation)", content: { application/json: { schema: { oneOf: [{ $ref: "#/components/schemas/Accepted" }, { $ref: "#/components/schemas/Dropped" }, { $ref: "#/components/schemas/Ignored" }] } } } }
     Ingress200: { description: "Duplicate delivery (already held), or Slack url_verification", content: { application/json: { schema: { $ref: "#/components/schemas/Duplicate" } } } }
@@ -275,3 +1295,237 @@ components:
             email: { type: string }
         relayfileBaseUrl: { type: [string, "null"], format: uri }
         status: { enum: [active, disabled] }
+    RunStatus:
+      enum: [pending, running, completed, failed, cancelled]
+    EnrollmentTokenSummary:
+      type: object
+      required: [id, tokenHint, status, expiresAt, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: [string, "null"]
+        tags:
+          type: array
+          items:
+            type: string
+        tokenHint:
+          type: string
+        status:
+          enum: [active, used, expired, revoked]
+        expiresAt:
+          type: string
+          format: date-time
+        usedAt:
+          type: [string, "null"]
+        usedByWorkerId:
+          type: [string, "null"]
+        revokedAt:
+          type: [string, "null"]
+        createdAt:
+          type: string
+          format: date-time
+        createdBy:
+          type: [string, "null"]
+    Worker:
+      type: object
+      required: [id, workspaceId, name, displayName, hostInfo, tags, status, lastSeen, registeredAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        workspaceId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        displayName:
+          type: string
+        hostInfo:
+          type: object
+        tags:
+          type: array
+          items:
+            type: string
+        status:
+          enum: [pending, online, offline, revoked]
+          description: online when seen (heartbeat or queue stream) within 90 s
+        lastSeen:
+          type: [string, "null"]
+          format: date-time
+        registeredAt:
+          type: string
+          format: date-time
+        registeredBy:
+          type: [string, "null"]
+        currentRunId:
+          type: [string, "null"]
+    FlowInput:
+      type: object
+      required: [name, source]
+      properties:
+        name:
+          type: string
+          maxLength: 100
+        description:
+          type: [string, "null"]
+        fileType:
+          enum: [yaml, ts]
+          default: yaml
+        source:
+          type: string
+          maxLength: 262144
+    Flow:
+      type: object
+      required: [id, workspaceId, name, fileType, createdAt, updatedAt, stepCount, runCount]
+      properties:
+        id:
+          type: string
+          format: uuid
+        workspaceId:
+          type: string
+        name:
+          type: string
+        description:
+          type: [string, "null"]
+        fileType:
+          enum: [yaml, ts]
+        createdBy:
+          type: [string, "null"]
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+        stepCount:
+          type: integer
+        runCount:
+          type: integer
+        lastRun:
+          type: [object, "null"]
+    RunOptions:
+      type: object
+      properties:
+        inputs: {}
+        envSecrets:
+          type: object
+          additionalProperties:
+            type: string
+          description: Encrypted at rest; delivered only in the worker payload.
+        runtime:
+          type: object
+          properties:
+            id:
+              const: worker
+            config:
+              type: object
+              properties:
+                workerId:
+                  type: string
+                  format: uuid
+                name:
+                  type: string
+                tags:
+                  type: array
+                  items:
+                    type: string
+    Run:
+      type: object
+      required: [runId, workspaceId, workflow, workflowName, fileType, dispatchType, status, trigger, createdAt, updatedAt]
+      properties:
+        runId:
+          type: string
+          format: uuid
+        workspaceId:
+          type: string
+        flowId:
+          type: [string, "null"]
+        workflow:
+          type: string
+          description: Display name (same as workflowName)
+        workflowName:
+          type: string
+        fileType:
+          enum: [yaml, ts]
+        workflowFileName:
+          type: string
+        dispatchType:
+          enum: [worker, local]
+        status:
+          $ref: "#/components/schemas/RunStatus"
+        trigger:
+          type: string
+        workerId:
+          type: [string, "null"]
+        workerName:
+          type: [string, "null"]
+        assignmentStatus:
+          type: [string, "null"]
+        resumedFromRunId:
+          type: [string, "null"]
+        resumedBy:
+          type: array
+          items:
+            type: object
+        exitCode:
+          type: [integer, "null"]
+        durationMs:
+          type: [integer, "null"]
+        summary:
+          type: [string, "null"]
+        error:
+          type: [string, "null"]
+        result: {}
+        inputs: {}
+        hasEnvSecrets:
+          type: boolean
+        hasCodeArchive:
+          type: boolean
+        startedAt:
+          type: [string, "null"]
+        completedAt:
+          type: [string, "null"]
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+    Step:
+      type: object
+      required: [stepName, status, source, dependsOn]
+      properties:
+        stepName:
+          type: string
+        label:
+          type: [string, "null"]
+        stepType:
+          type: [string, "null"]
+        agent:
+          type: [string, "null"]
+        status:
+          type: string
+          description: pending, running, waiting, completed, failed, skipped, or unknown
+        source:
+          enum: [declared, snapshot, final]
+        attempt:
+          type: [integer, "null"]
+        startTime:
+          type: [string, "null"]
+        endTime:
+          type: [string, "null"]
+        durationMs:
+          type: [integer, "null"]
+        exitCode:
+          type: [integer, "null"]
+        outputSummary:
+          type: [string, "null"]
+        error:
+          type: [string, "null"]
+        completionReason:
+          type: [string, "null"]
+        retryCount:
+          type: [integer, "null"]
+        dependsOn:
+          type: array
+          items:
+            type: string
+        detail: {}

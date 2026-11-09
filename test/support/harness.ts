@@ -2,7 +2,7 @@ import { createHash, createHmac, randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type RequestListener, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { PGlite } from "@electric-sql/pglite";
-import { createApp, type App } from "../../src/app.ts";
+import { createApp, type App, type FlowsDeps } from "../../src/app.ts";
 import { type Config, testConfig } from "../../src/config.ts";
 import { type Db, pgDb, pgliteDb } from "../../src/db/db.ts";
 import { migrate } from "../../src/db/migrate.ts";
@@ -114,12 +114,12 @@ export type TestApp = {
   post: (path: string, body: string, headers?: Record<string, string>) => Promise<{ status: number; json: any; headers: Headers; text: string }>;
 };
 
-export async function startApp(opts: { db?: Db; config?: Config } = {}): Promise<TestApp> {
+export async function startApp(opts: { db?: Db; config?: Config; flows?: FlowsDeps } = {}): Promise<TestApp> {
   const db = opts.db ?? (await newPglite());
   const config = opts.config ?? fixtureConfig();
   const logger = new MemoryLogger();
   const entitlement = new StaticEntitlement(true);
-  const app = createApp({ config, db, logger, entitlement });
+  const app = createApp({ config, db, logger, entitlement, ...(opts.flows ? { flows: opts.flows } : {}) });
   const pub = await listen(app.publicHandler);
   const adm = await listen(app.adminHandler);
   return {
