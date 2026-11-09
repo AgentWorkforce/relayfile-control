@@ -201,6 +201,15 @@ hold relay-control ids that were validated through introspection, so they
 have no foreign keys. Deleting a workspace in relay-control reaches this
 service through the internal workspace delete route, not a foreign key.
 
+## Container image
+
+Pushes to `main` publish `ghcr.io/agentworkforce/relayfile-control:sha-<short>`
+and `:main`; a `v<semver>` tag publishes `:<version>` and `:latest`
+(`.github/workflows/publish-image.yml`, linux/amd64 + linux/arm64, SBOM and
+signed provenance). Release tags are never overwritten. Pull requests only
+build the image (`ci.yml`), they never push. Deployments pin the `sha-<short>`
+or `<version>` tag; `:main` and `:latest` move.
+
 ## Development
 
 ```sh

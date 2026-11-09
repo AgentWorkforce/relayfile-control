@@ -1,0 +1,180 @@
+# Publish the relayfile-control image to GHCR. Same shape as relay-control's
+# release workflow (multi-arch, SBOM + provenance, signed attestation), but
+# driven by pushes instead of a manual dispatch:
+#   push to main  -> ghcr.io/agentworkforce/relayfile-control:sha-<short> and :main
+#   push tag v*   -> ghcr.io/agentworkforce/relayfile-control:<version> and :latest
+# Pull requests never reach this workflow (no pull_request trigger), so forks
+# cannot push. This workflow deploys nothing; infra consumes the tags.
+name: publish-image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+# One publication at a time per ref; never cancel a push that is mid-manifest.
+concurrency:
+  group: publish-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish multi-arch image
+    # Same selector as ci.yml: a fork PR would stay on GitHub-hosted runners;
+    # pushes use the CI_LINUX_RUNNER repo variable when set, else ubuntu-latest.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    # Only this repository publishes under its own name; a fork running the
+    # workflow on its main would otherwise push to ghcr.io/<fork-owner>/...
+    if: github.repository == 'AgentWorkforce/relayfile-control'
+    permissions:
+      contents: read
+      packages: write
+      # Sigstore signing (OIDC) and storing GitHub artifact attestations.
+      id-token: write
+      attestations: write
+    steps:
+      - name: Resolve image tags
+        id: tags
+        shell: bash
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${OWNER,,}/relayfile-control"
+          short="${SHA:0:7}"
+          if [[ "$REF_TYPE" == "tag" ]]; then
+            [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || {
+              echo "::error::tag $REF_NAME is not a v<semver> release tag."
+              exit 1
+            }
+            version="${REF_NAME#v}"
+            version="${version//+/_}"   # OCI tags cannot contain '+'
+            {
+              echo "image=$image"
+              echo "immutable_tag=$version"
+              echo "moving_tag=latest"
+              echo "image_version=$version"
+            } >> "$GITHUB_OUTPUT"
+          elif [[ "$REF_TYPE" == "branch" && "$REF_NAME" == "main" ]]; then
+            {
+              echo "image=$image"
+              echo "immutable_tag=sha-$short"
+              echo "moving_tag=main"
+              echo "image_version=0.0.0-main.$short"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::unexpected ref $REF_TYPE/$REF_NAME"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Release tags are never overwritten. sha-<short> is re-pushable (same
+      # source commit, same content) so a re-run after a transient failure works.
+      - name: Refuse an existing release tag
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.tags.outputs.image }}
+          TAG: ${{ steps.tags.outputs.immutable_tag }}
+        run: |
+          set -euo pipefail
+          output_file="$RUNNER_TEMP/imagetools-$TAG.txt"
+          if docker buildx imagetools inspect "$IMAGE:$TAG" >"$output_file" 2>&1; then
+            echo "::error::$IMAGE:$TAG already exists; release tags are never overwritten."
+            exit 1
+          fi
+          if ! grep -Eqi 'manifest unknown|name unknown|not found' "$output_file"; then
+            cat "$output_file" >&2
+            echo "::error::Could not prove $IMAGE:$TAG is absent; failing closed."
+            exit 1
+          fi
+
+      - name: Build and publish
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            IMAGE_REVISION=${{ github.sha }}
+            IMAGE_VERSION=${{ steps.tags.outputs.image_version }}
+          tags: |
+            ${{ steps.tags.outputs.image }}:${{ steps.tags.outputs.immutable_tag }}
+            ${{ steps.tags.outputs.image }}:${{ steps.tags.outputs.moving_tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tags.outputs.image_version }}
+          provenance: mode=max
+          sbom: true
+
+      # A signed Sigstore provenance bundle, stored in GitHub and pushed to the registry.
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.tags.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify and report digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ steps.tags.outputs.image }}
+          IMMUTABLE_TAG: ${{ steps.tags.outputs.immutable_tag }}
+          MOVING_TAG: ${{ steps.tags.outputs.moving_tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+            echo "::error::Build did not return a valid OCI digest."
+            exit 1
+          }
+          for tag in "$IMMUTABLE_TAG" "$MOVING_TAG"; do
+            resolved="$(
+              docker buildx imagetools inspect "$IMAGE:$tag" \
+                --format '{{json .Manifest.Digest}}' | tr -d '"'
+            )"
+            [[ "$resolved" == "$DIGEST" ]] || {
+              echo "::error::$IMAGE:$tag resolved to $resolved, expected $DIGEST."
+              exit 1
+            }
+          done
+          {
+            echo "### relayfile-control image published"
+            echo
+            echo "Image: \`$IMAGE@$DIGEST\`"
+            echo "Tags: \`$IMAGE:$IMMUTABLE_TAG\`, \`$IMAGE:$MOVING_TAG\`"
+            echo "Source commit: \`$SHA\`"
+            echo "Platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo
+            echo "BuildKit OCI SBOM and max-mode provenance attestations were requested."
+            echo "A signed GitHub artifact attestation (SLSA provenance) was pushed."
+            echo "No deployment was performed."
+          } >> "$GITHUB_STEP_SUMMARY"
