@@ -1,6 +1,6 @@
 # relayfile-control: per-run Relayfile credential for self-host Flows workers
 
-Status: draft for coordination, 2026-11-09 (rev 2, reconciled with
+Status: design, 2026-11-09 (rev 3, decisions taken; rev 2 reconciled with
 layered-control's issuer contract, relay message 245581962694701056).
 Author: layered-relayfile (relayfile-control side). Counterpart:
 layered-control (relay-control issuer; its doc lands as relay-control
@@ -27,7 +27,7 @@ neither the cause nor the owner.
 |-----|-------|
 | No per-run Relayfile credential exists in self-host. | layered-control (relay-control issues it). |
 | relayfile-control hands out whatever it has, including `""`, unverified. | layered-relayfile (this document). |
-| Worker launcher accepts only `relay_pa_` tokens. | asked of lead-desktop (§4). |
+| Worker launcher accepts only `relay_pa_` tokens. | relayflows-node-spawn (§4). |
 
 Relayfile's verifier needs no change in `introspection` mode: since
 relayfile#568 (merged 7d50e49e) it sends every bearer to relay-control's
@@ -230,25 +230,28 @@ yet expose the introspection env slots (flagged to infra-kind-stack after
 relayfile#568). Positive introspection answers are cached for at most 60 s,
 so a revoked credential can be honoured for up to 60 s after `finishRun`.
 
-## 4. Worker side (not mine, asked of lead-desktop)
+## 4. Worker side (relayflows-node-spawn)
 
 The Cloud launcher refuses any scoped workflow token that does not start
 with `relay_pa_` (cloud `packages/core/src/bootstrap/launcher.ts:1271`).
 The self-host worker must accept `sh_fr_` when the control plane is
 relaycontrol, and must treat an absent `relayfileToken` as a clear refusal
-of Flows-to-File that names the run event's code. layered-control has asked
-lead-desktop for the owner; this document only depends on the field names.
+of Flows-to-File that names the run event's code. Owner per lead-desktop
+(2026-11-09): relayflows-node-spawn; this document only depends on the
+field names in §2.6.
 
-## 5. Decisions needed
+## 5. Decisions
 
-- **D1** Unconfigured or refused credential: run proceeds without
-  Relayfile plus the run event (recommended; Relayfile is an optional paid
-  add-on per Khaliq 2026-11-07), or the claim is refused until the add-on
-  is configured.
+Taken by lead-desktop on 2026-11-09 (relay message 245583015908843520) on
+this note's recommendations; Khaliq can override.
+
+- **D1** Unconfigured or refused credential: the run proceeds without
+  Relayfile and carries the refusal event (Relayfile is an optional paid
+  add-on per Khaliq 2026-11-07). Taken.
 - **D2** Repository narrowing for GitHub/GitLab mounts needs a repository
-  grant on the run record. Follow-up after phase 1.
+  grant on the run record. Follow-up after phase 1. Taken.
 - **D3** TTL default 12 h on the issuer side; relayfile-control adds no
-  knob.
+  knob. Taken.
 
 ## 6. Sequence
 
