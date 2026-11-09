@@ -45,6 +45,24 @@ export function flowsKeyring(config: Config): EncryptionKeyring {
   return { active, previous };
 }
 
+/**
+ * Origins a cookie-authenticated browser request may come from (relay-control's
+ * browserOriginsFor): this service's public origin, the Flows public URL's
+ * origin and the dashboard's origin.
+ */
+export function browserOrigins(...urls: Array<string | undefined>): string[] {
+  const out = new Set<string>();
+  for (const value of urls) {
+    if (!value) continue;
+    try {
+      out.add(new URL(value).origin);
+    } catch {
+      // not a URL; config validation already refused it
+    }
+  }
+  return [...out];
+}
+
 export type FlowsRuntime = { deps: FlowsDeps; outbox: RevokeOutbox };
 
 /**
@@ -55,8 +73,11 @@ export function buildFlows(config: Config, db: Db, logger: Logger, env: NodeJS.P
   const baseUrl = config.RELAYCONTROL_BASE_URL;
   const introspectSecret = config.RELAYCONTROL_INTROSPECT_SECRET;
   const brokerSecret = config.RELAYFILE_CONTROL_BROKER_SECRET;
-  if (!baseUrl || !introspectSecret || !brokerSecret) {
-    throw new Error("Flows require RELAYCONTROL_BASE_URL, RELAYCONTROL_INTROSPECT_SECRET and RELAYFILE_CONTROL_BROKER_SECRET");
+  const publicOrigin = config.RELAYFILE_CONTROL_PUBLIC_ORIGIN;
+  if (!baseUrl || !introspectSecret || !brokerSecret || !publicOrigin) {
+    throw new Error(
+      "Flows require RELAYCONTROL_BASE_URL, RELAYCONTROL_INTROSPECT_SECRET, RELAYFILE_CONTROL_BROKER_SECRET and RELAYFILE_CONTROL_PUBLIC_ORIGIN",
+    );
   }
   const flowsConfig = loadFlowsConfig(env);
   const relaycastFallback = env.RELAYCAST_PUBLIC_URL?.trim() || "";
@@ -67,18 +88,22 @@ export function buildFlows(config: Config, db: Db, logger: Logger, env: NodeJS.P
   const seam = { baseUrl, secret: brokerSecret };
   store.cliCredentials = httpCliCredentialBroker(seam);
   store.relaycastCredentials = httpRelaycastCredentialSource(seam);
+  store.logger = logger;
   const introspect = createIntrospector({
     baseUrl,
     secret: introspectSecret,
-    audience: config.RELAYFILE_CONTROL_PUBLIC_ORIGIN,
+    audience: publicOrigin,
     cacheSeconds: config.FLOWS_INTROSPECTION_CACHE_SECONDS,
   });
   const outbox = new RevokeOutbox({ db, broker: store.cliCredentials, logger, intervalMs: config.FLOWS_REVOKE_OUTBOX_INTERVAL_MS });
+  const publicBaseUrl = config.FLOWS_PUBLIC_BASE_URL ?? publicOrigin;
   return {
     deps: {
       store,
-      userAccess: introspectionUserAccess(introspect),
-      publicBaseUrl: config.FLOWS_PUBLIC_BASE_URL ?? config.RELAYFILE_CONTROL_PUBLIC_ORIGIN,
+      userAccess: introspectionUserAccess(introspect, {
+        allowedOrigins: browserOrigins(publicOrigin, publicBaseUrl, flowsConfig.dashboardUrl),
+      }),
+      publicBaseUrl,
     },
     outbox,
   };

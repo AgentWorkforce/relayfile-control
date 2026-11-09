@@ -4,20 +4,33 @@ import type { Db } from "../../src/db/db.ts";
 import type { CliCredentialBroker, RelaycastCredentials, RelaycastCredentialSource } from "../../src/flows/broker.ts";
 import { defaultFlowsConfig, type FlowsConfig } from "../../src/flows/config.ts";
 import { flowsDatabase } from "../../src/flows/database.ts";
-import { introspectionUserAccess, type Introspection, type Introspector } from "../../src/flows/introspection.ts";
+import {
+  createIntrospector,
+  introspectionUserAccess,
+  type Introspection,
+  type Introspector,
+} from "../../src/flows/introspection.ts";
 import { FlowsStore } from "../../src/flows/store.ts";
 import { fixtureConfig, newPglite, startApp } from "./harness.ts";
 
 export const PUBLIC_BASE_URL = "https://control.selfhosted.company";
 export const RELAYCAST_PUBLIC_URL = "https://relaycast.selfhosted.company";
+/** testConfig's RELAYFILE_CONTROL_PUBLIC_ORIGIN: the introspection audience. */
+export const AUDIENCE = "http://relayfile-control.test";
+export const RELAYCONTROL_URL = "http://relay-control.test";
 
 /**
  * Fake relay-control introspection: tokens minted by `mint` answer as active
- * desktop-user tokens; anything else is inactive `unknown`.
+ * desktop-user tokens; anything else is inactive `unknown`. A supplied
+ * workspace other than the token's answers inactive `workspace`, as
+ * relay-control does. `fetch` serves it over the HTTP contract so routes go
+ * through the real client (and its local claim checks).
  */
 export class FakeIntrospection {
   readonly tokens = new Map<string, Introspection>();
   readonly calls: Array<{ token: string; workspace?: string }> = [];
+  /** When set, the endpoint answers this status instead (an outage). */
+  failWith: number | null = null;
 
   mint(input: { userId: string; email: string; organizationId: string; workspaceId: string; role: "owner" | "admin" | "member" }): string {
     const token = `sh_at_${randomBytes(16).toString("hex")}`;
@@ -31,14 +44,31 @@ export class FakeIntrospection {
       role: input.role,
       scopes: [],
       exp: Math.floor(Date.now() / 1000) + 3600,
+      aud: AUDIENCE,
+      iat: Math.floor(Date.now() / 1000),
       token_id: randomBytes(16).toString("hex"),
     });
     return token;
   }
 
+  /** Changes fields of a minted token's answer. */
+  patch(token: string, fields: Record<string, unknown>): void {
+    const answer = this.tokens.get(token);
+    assert.ok(answer, "unknown token");
+    this.tokens.set(token, { ...answer, ...fields } as Introspection);
+  }
+
   readonly introspect: Introspector = async (token, workspace) => {
     this.calls.push({ token, ...(workspace !== undefined ? { workspace } : {}) });
-    return this.tokens.get(token) ?? { active: false, reason: "unknown" };
+    const answer = this.tokens.get(token) ?? { active: false, reason: "unknown" };
+    if (answer.active && workspace !== undefined && workspace !== answer.workspace) return { active: false, reason: "workspace" };
+    return answer;
+  };
+
+  readonly fetch: typeof fetch = async (_input, init) => {
+    if (this.failWith !== null) return new Response("{}", { status: this.failWith });
+    const body = JSON.parse(String(init?.body)) as { token: string; workspace?: string };
+    return Response.json(await this.introspect(body.token, body.workspace));
   };
 }
 
@@ -119,7 +149,10 @@ export const ENCRYPTION_KEYRING = { active: { id: "test-key", key: Buffer.alloc(
  * relayfile-control with the Flows API mounted, a fake introspection, a fake
  * credential broker and a fake Relaycast binding source.
  */
-export async function startControlPlane(flowsOverrides: Partial<FlowsConfig> = {}) {
+export async function startControlPlane(
+  flowsOverrides: Partial<FlowsConfig> = {},
+  configOverrides: Parameters<typeof fixtureConfig>[0] = {},
+) {
   const db: Db = await newPglite();
   const introspection = new FakeIntrospection();
   const broker = new FakeBroker();
@@ -132,10 +165,21 @@ export async function startControlPlane(flowsOverrides: Partial<FlowsConfig> = {
   );
   flows.cliCredentials = broker;
   flows.relaycastCredentials = fakeRelaycast(relaycastKeys);
+  const introspect = createIntrospector({
+    baseUrl: RELAYCONTROL_URL,
+    secret: "i".repeat(32),
+    audience: AUDIENCE,
+    cacheSeconds: 0,
+    fetchImpl: introspection.fetch,
+  });
   const app = await startApp({
     db,
-    config: fixtureConfig(),
-    flows: { store: flows, userAccess: introspectionUserAccess(introspection.introspect), publicBaseUrl: PUBLIC_BASE_URL },
+    config: fixtureConfig(configOverrides),
+    flows: {
+      store: flows,
+      userAccess: introspectionUserAccess(introspect, { allowedOrigins: [AUDIENCE, PUBLIC_BASE_URL] }),
+      publicBaseUrl: PUBLIC_BASE_URL,
+    },
   });
   return {
     database: db,

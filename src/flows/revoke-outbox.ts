@@ -79,16 +79,14 @@ export class RevokeOutbox {
     let failed = 0;
     for (const row of leased.rows) {
       try {
+        // Only a 2xx acknowledgement deletes the row: revokeForRun is
+        // idempotent, so relay-control answers 2xx even for a run it never
+        // issued a reference for. Any other status (404 included: a wrong
+        // route or base URL) is retried with backoff.
         await this.#broker.revokeForRun(row.run_id);
         await this.#db.query("DELETE FROM selfhost_cli_credential_revocations WHERE run_id = $1", [row.run_id]);
         delivered += 1;
       } catch (error) {
-        // A run relay-control never issued a reference for has nothing to revoke.
-        if (error instanceof BrokerError && error.status === 404) {
-          await this.#db.query("DELETE FROM selfhost_cli_credential_revocations WHERE run_id = $1", [row.run_id]);
-          delivered += 1;
-          continue;
-        }
         failed += 1;
         const reason = error instanceof BrokerError ? error.code : error instanceof Error ? error.name : "error";
         const delay = revokeRetryDelayMs(Number(row.attempts), this.#baseDelayMs, this.#maxDelayMs);
@@ -102,6 +100,7 @@ export class RevokeOutbox {
           area: "flows",
           runId: row.run_id,
           attempts: Number(row.attempts),
+          ...(error instanceof BrokerError ? { status: error.status } : {}),
           reason,
           retryInMs: delay,
         });

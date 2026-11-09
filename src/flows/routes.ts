@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { BrokerError } from "./broker.ts";
 import { MAX_OBJECT_BYTES, validateObjectKey } from "./objects.ts";
 import {
   cleanTags,
@@ -25,9 +26,15 @@ export type Principal = {
   expiresAt: number;
 };
 
+/**
+ * Authenticates a Flows user request. `workspace`, when the route names one,
+ * is sent to relay-control's introspection, which refuses a token for any
+ * other workspace.
+ */
 export type FlowsUserAccess = (
   request: IncomingMessage,
   admin?: boolean,
+  workspace?: string,
 ) => Promise<{
   principal: Principal;
   workspace: { id: string; organizationId: string; role: Principal["role"] };
@@ -241,9 +248,10 @@ export function createFlowsHandler(deps: {
         try {
           assignment = await store.claimNext(worker);
         } catch (error) {
-          console.error("[selfhost-api] assignment delivery deferred", {
+          store.logger?.event("flows_assignment_deferred", {
+            area: "flows",
             workerId: worker.id,
-            error: error instanceof Error ? error.message : String(error),
+            error: error instanceof Error ? error.name : "unknown",
           });
         }
         if (assignment) {
@@ -265,9 +273,10 @@ export function createFlowsHandler(deps: {
         wake = undefined;
       }
     } catch (error) {
-      console.error("[selfhost-api] worker queue stream failed", {
+      store.logger?.event("flows_queue_stream_failed", {
+        area: "flows",
         workerId: worker.id,
-        error: error instanceof Error ? error.message : String(error),
+        error: error instanceof Error ? error.name : "unknown",
       });
     } finally {
       unsubscribe();
@@ -398,9 +407,13 @@ export function createFlowsHandler(deps: {
           return true;
         }
       } catch (error) {
-        const coded = error as { status?: unknown; code?: unknown; message?: unknown };
-        if (typeof coded.status === "number" && typeof coded.code === "string") {
-          throw new FlowsError(coded.status, coded.code, String(coded.message ?? coded.code));
+        if (error instanceof BrokerError) {
+          // relay-control refusing this service's own credential is a
+          // configuration fault here, not something the worker can fix.
+          if (error.status === 401 || error.status === 403) {
+            throw new FlowsError(502, "credential_broker_rejected", "The credential broker refused this service");
+          }
+          throw new FlowsError(error.status, error.code, error.message);
         }
         throw error;
       }
@@ -437,6 +450,7 @@ export function createFlowsHandler(deps: {
         const access = await userAccess(request, true);
         const body = await jsonBody(request, 16 * 1024);
         const workspaceId = str(body, "workspaceId");
+        if (workspaceId) await userAccess(request, true, workspaceId);
         if (workspaceId && workspaceId !== access.workspace.id) {
           throw new FlowsError(404, "workspace_not_found", "Workspace not found");
         }
@@ -588,6 +602,7 @@ export function createFlowsHandler(deps: {
     if (path === "/api/v1/workflows/run" && method === "POST") {
       const access = await userAccess(request);
       const body = await jsonBody(request);
+      if (typeof body.workspaceId === "string") await userAccess(request, false, body.workspaceId);
       if (body.workspaceId !== undefined && body.workspaceId !== access.workspace.id) {
         throw new FlowsError(404, "workspace_not_found", "Workspace not found");
       }
@@ -649,6 +664,7 @@ export function createFlowsHandler(deps: {
     if (path === "/api/v1/workflows/local-run" && method === "POST") {
       const access = await userAccess(request);
       const body = await jsonBody(request);
+      if (typeof body.workspaceId === "string") await userAccess(request, false, body.workspaceId);
       if (body.workspaceId !== undefined && body.workspaceId !== access.workspace.id) {
         throw new FlowsError(404, "workspace_not_found", "Workspace not found");
       }

@@ -9,7 +9,8 @@ import {
   type EncryptionKeyring,
 } from "./crypto.ts";
 import type { CliCredentialBroker, RelaycastCredentialSource } from "./broker.ts";
-import { RelaycastCredentialsUnavailable } from "./broker.ts";
+import { RelaycastBindingRefused, RelaycastCredentialsUnavailable } from "./broker.ts";
+import type { Logger } from "../observability/log.ts";
 import type { FlowsConfig } from "./config.ts";
 import { enqueueCredentialRevocation } from "./revoke-outbox.ts";
 import { summarizeDefinition, type DeclaredStep } from "./definition.ts";
@@ -220,6 +221,15 @@ export class FlowsStore {
   cliCredentials?: CliCredentialBroker;
   /** The workspace's Relaycast binding, owned by relay-control. */
   relaycastCredentials?: RelaycastCredentialSource;
+  /** Structured events (names and ids only, never secrets or error text). */
+  logger?: Logger;
+  /**
+   * How long a workspace's queue stays paused after relay-control refused
+   * its Relaycast binding (4xx). A refusal is a configuration error, so the
+   * claim is released and the workspace is not retried in a tight loop.
+   */
+  relaycastRefusalHoldMs = 60_000;
+  readonly #relaycastRefusedUntil = new Map<string, number>();
   readonly #listeners = new Set<() => void>();
 
   constructor(
@@ -1184,9 +1194,10 @@ export class FlowsStore {
       try {
         records.push(this.assignmentFromRow(row, await this.workflowPayload(String(row.run_id))));
       } catch (error) {
-        console.error("[selfhost-api] assignment redelivery deferred", {
-          runId: row.run_id,
-          error: error instanceof Error ? error.message : String(error),
+        this.logger?.event("flows_assignment_redelivery_deferred", {
+          area: "flows",
+          runId: String(row.run_id),
+          error: error instanceof Error ? error.name : "unknown",
         });
       }
     }
@@ -1198,6 +1209,11 @@ export class FlowsStore {
    * assignment at a time, matching the serial CLI loop.
    */
   async claimNext(worker: { id: string; workspaceId: string; tags: string[] }): Promise<WorkAssignmentRecord | null> {
+    const heldUntil = this.#relaycastRefusedUntil.get(worker.workspaceId);
+    if (heldUntil !== undefined) {
+      if (heldUntil > Date.now()) return null;
+      this.#relaycastRefusedUntil.delete(worker.workspaceId);
+    }
     const claimed = await this.database.transaction(async (tx) => {
       const busy = await tx.query(
         `SELECT 1 FROM selfhost_work_assignments
@@ -1245,6 +1261,20 @@ export class FlowsStore {
           WHERE id = $1 AND status = 'assigned' AND acked_at IS NULL`,
         [claimed.id, claimed.requested_worker_id ?? null],
       );
+      if (error instanceof RelaycastBindingRefused) {
+        // A configuration error, not an outage: one event, then the
+        // workspace's queue waits instead of re-claiming every poll.
+        this.#relaycastRefusedUntil.set(worker.workspaceId, Date.now() + this.relaycastRefusalHoldMs);
+        this.logger?.event("flows_relaycast_binding_refused", {
+          area: "flows",
+          workspaceId: worker.workspaceId,
+          runId: String(claimed.run_id),
+          status: error.status,
+          code: error.code,
+          retryInMs: this.relaycastRefusalHoldMs,
+        });
+        return null;
+      }
       throw error;
     }
   }
@@ -1270,6 +1300,52 @@ export class FlowsStore {
       workspaceId: row.workspace_id,
       scopes: ["runtime:env:read", "runtime:integrations:read"],
     };
+  }
+
+  /**
+   * Deletes everything this service holds for a workspace relay-control
+   * deleted: flows, runs (with their encrypted envSecrets, events, steps,
+   * assignments and stored objects), workers and enrollment tokens. Every
+   * run's CLI-credential references are queued for revocation in the same
+   * transaction. Idempotent: a second call deletes nothing.
+   */
+  async deleteWorkspace(workspaceId: string): Promise<{
+    flows: number;
+    runs: number;
+    workers: number;
+    enrollmentTokens: number;
+    revocationsQueued: number;
+  }> {
+    if (!isUuid(workspaceId)) throw new FlowsError(400, "invalid_request", "workspace id must be a UUID");
+    const counts = await this.database.transaction(async (tx) => {
+      const revocations = await tx.query(
+        `INSERT INTO selfhost_cli_credential_revocations (run_id)
+         SELECT id FROM selfhost_workflow_runs WHERE workspace_id = $1
+         ON CONFLICT (run_id) DO NOTHING
+         RETURNING run_id`,
+        [workspaceId],
+      );
+      const runs = await tx.query("DELETE FROM selfhost_workflow_runs WHERE workspace_id = $1 RETURNING id", [workspaceId]);
+      // Assignments cascade with their runs; this catches any left without one.
+      await tx.query("DELETE FROM selfhost_work_assignments WHERE workspace_id = $1", [workspaceId]);
+      const flows = await tx.query("DELETE FROM selfhost_flow_definitions WHERE workspace_id = $1 RETURNING id", [workspaceId]);
+      const workers = await tx.query("DELETE FROM selfhost_workers WHERE workspace_id = $1 RETURNING id", [workspaceId]);
+      const tokens = await tx.query(
+        "DELETE FROM selfhost_worker_enrollment_tokens WHERE workspace_id = $1 RETURNING id",
+        [workspaceId],
+      );
+      return {
+        flows: flows.rows.length,
+        runs: runs.rows.length,
+        workers: workers.rows.length,
+        enrollmentTokens: tokens.rows.length,
+        revocationsQueued: revocations.rows.length,
+      };
+    });
+    this.#relaycastRefusedUntil.delete(workspaceId);
+    // Open queue streams of the deleted workers see them gone and end.
+    this.notifyWork();
+    return counts;
   }
 
   private async workerAssignment(tx: SqlExecutor, workerId: string, runId: string): Promise<Row | null> {

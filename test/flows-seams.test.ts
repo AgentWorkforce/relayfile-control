@@ -21,8 +21,10 @@ workflows:
         command: printf 'hello\\n'
 `;
 
-test("RELAYFILE_CONTROL_PUBLIC_ORIGIN must be an absolute http(s) origin", () => {
-  assert.throws(() => loadConfig({}), /RELAYFILE_CONTROL_PUBLIC_ORIGIN/);
+test("RELAYFILE_CONTROL_PUBLIC_ORIGIN and RELAYCONTROL_BASE_URL must be absolute http(s) origins", () => {
+  // Webhook-only deployments start without either.
+  assert.equal(loadConfig({}).RELAYFILE_CONTROL_PUBLIC_ORIGIN, undefined);
+  assert.equal(loadConfig({ RELAYFILE_CONTROL_PUBLIC_ORIGIN: "  " }).RELAYFILE_CONTROL_PUBLIC_ORIGIN, undefined);
   for (const bad of [
     "relayfile-control.example",
     "ftp://relayfile-control.example",
@@ -31,19 +33,43 @@ test("RELAYFILE_CONTROL_PUBLIC_ORIGIN must be an absolute http(s) origin", () =>
     "https://relayfile-control.example/#x",
     "https://user:pw@relayfile-control.example",
     "/relative",
-    "",
   ]) {
     assert.throws(() => loadConfig({ RELAYFILE_CONTROL_PUBLIC_ORIGIN: bad }), /RELAYFILE_CONTROL_PUBLIC_ORIGIN/, bad);
+    assert.throws(() => loadConfig({ RELAYCONTROL_BASE_URL: bad }), /RELAYCONTROL_BASE_URL/, bad);
   }
+  assert.equal(loadConfig({ RELAYCONTROL_BASE_URL: "http://Relay-Control.internal:8080/" }).RELAYCONTROL_BASE_URL, "http://relay-control.internal:8080");
   assert.equal(loadConfig({ RELAYFILE_CONTROL_PUBLIC_ORIGIN: "https://Files.Example.com:443/" }).RELAYFILE_CONTROL_PUBLIC_ORIGIN, "https://files.example.com");
   assert.equal(loadConfig({ RELAYFILE_CONTROL_PUBLIC_ORIGIN: "http://localhost:8080" }).RELAYFILE_CONTROL_PUBLIC_ORIGIN, "http://localhost:8080");
 });
 
-test("Flows secrets: _FILE indirection, 32-byte telemetry minimum, FLOWS_ENABLED requirements", () => {
+test("Flows secrets: _FILE indirection, 32-byte minimums, distinct values, FLOWS_ENABLED requirements", () => {
   const origin = { RELAYFILE_CONTROL_PUBLIC_ORIGIN: "https://files.example.com" };
-  const files: Record<string, string> = { "/run/secrets/broker": "broker-secret\n" };
+  const files: Record<string, string> = { "/run/secrets/broker": "broker-secret\n", "/run/secrets/verify": `${"v".repeat(32)}\n` };
   const env = resolveFileSecrets({ ...origin, RELAYFILE_CONTROL_BROKER_SECRET_FILE: "/run/secrets/broker" }, (p) => files[p]!);
   assert.equal(env.RELAYFILE_CONTROL_BROKER_SECRET, "broker-secret");
+  const verifyEnv = resolveFileSecrets({ RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET_FILE: "/run/secrets/verify" }, (p) => files[p]!);
+  assert.equal(verifyEnv.RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET, "v".repeat(32));
+  assert.equal(
+    loadConfig({ RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET: verifyEnv.RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET }).RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET,
+    "v".repeat(32),
+  );
+  for (const key of ["RELAYCONTROL_INTROSPECT_SECRET", "RELAYFILE_CONTROL_BROKER_SECRET", "RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET"]) {
+    assert.throws(() => loadConfig({ [key]: "x".repeat(31) }), new RegExp(key), key);
+  }
+  // No two of the static shared secrets may be equal.
+  const shared = "s".repeat(40);
+  assert.throws(
+    () => loadConfig({ RELAYFILE_CONTROL_BROKER_SECRET: shared, RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET: shared }),
+    /invalid configuration: RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET$/,
+  );
+  assert.throws(
+    () => loadConfig({ RELAYCONTROL_INTROSPECT_SECRET: shared, RELAYFILE_CONTROL_TELEMETRY_SECRET: shared }),
+    /invalid configuration: RELAYFILE_CONTROL_TELEMETRY_SECRET$/,
+  );
+  assert.throws(
+    () => loadConfig({ RELAYCONTROL_INTROSPECT_SECRET: shared, RELAYFILE_CONTROL_BROKER_SECRET: shared }),
+    /invalid configuration: RELAYFILE_CONTROL_BROKER_SECRET$/,
+  );
   assert.throws(
     () => resolveFileSecrets({ RELAYFILE_CONTROL_BROKER_SECRET: "x", RELAYFILE_CONTROL_BROKER_SECRET_FILE: "/run/secrets/broker" }, (p) => files[p]!),
     /not both/,
@@ -51,15 +77,17 @@ test("Flows secrets: _FILE indirection, 32-byte telemetry minimum, FLOWS_ENABLED
   assert.throws(() => loadConfig({ ...origin, RELAYFILE_CONTROL_TELEMETRY_SECRET: "short" }), /RELAYFILE_CONTROL_TELEMETRY_SECRET/);
   assert.equal(loadConfig({ ...origin, RELAYFILE_CONTROL_TELEMETRY_SECRET: SECRET }).RELAYFILE_CONTROL_TELEMETRY_SECRET, SECRET);
   assert.throws(() => loadConfig({ ...origin, FLOWS_ENABLED: "true" }), /RELAYCONTROL_BASE_URL, RELAYCONTROL_INTROSPECT_SECRET, RELAYFILE_CONTROL_BROKER_SECRET, RELAYFILE_CONTROL_ENCRYPTION_KEY_ID, RELAYFILE_CONTROL_ENCRYPTION_KEY$/);
-  const enabled = loadConfig({
-    ...origin,
+  const flows = {
     FLOWS_ENABLED: "true",
     RELAYCONTROL_BASE_URL: "http://relay-control.internal",
-    RELAYCONTROL_INTROSPECT_SECRET: "introspect",
-    RELAYFILE_CONTROL_BROKER_SECRET: "broker",
+    RELAYCONTROL_INTROSPECT_SECRET: "i".repeat(32),
+    RELAYFILE_CONTROL_BROKER_SECRET: "b".repeat(32),
     RELAYFILE_CONTROL_ENCRYPTION_KEY_ID: "k1",
     RELAYFILE_CONTROL_ENCRYPTION_KEY: "07".repeat(32),
-  });
+  };
+  // FLOWS_ENABLED needs the public origin (the introspection audience).
+  assert.throws(() => loadConfig(flows), /invalid configuration: RELAYFILE_CONTROL_PUBLIC_ORIGIN$/);
+  const enabled = loadConfig({ ...origin, ...flows });
   assert.equal(enabled.FLOWS_ENABLED, true);
 });
 
@@ -128,8 +156,26 @@ test("Flows user routes map introspection to relay-control's auth errors", async
   const cookie = { cookie: `agent_relay_session=${tenant.memberToken}` };
   assert.equal((await cp.api("/api/v1/flows", { headers: cookie })).status, 401);
   assert.equal((await cp.api("/cloud/api/v1/flows", { headers: cookie })).status, 200);
-  // No workspace is forwarded: the token's workspace is authoritative.
+  // A route without a workspace sends none: the token's workspace is authoritative.
   assert.ok(cp.introspection.calls.every((call) => call.workspace === undefined));
+  // A route naming one sends it; relay-control refuses another workspace's.
+  const calls = cp.introspection.calls.length;
+  const run = await cp.api("/api/v1/workflows/run", {
+    method: "POST",
+    token: tenant.memberToken,
+    body: { workspaceId: tenant.workspaceId, workflow: FLOW, fileType: "yaml" },
+  });
+  assert.equal(run.status, 201);
+  assert.deepEqual(cp.introspection.calls.slice(calls).map((call) => call.workspace), [undefined, tenant.workspaceId]);
+  for (const path of ["/api/v1/workflows/run", "/api/v1/workflows/local-run", "/api/v1/workers/enrollment-tokens"]) {
+    const other = await cp.api(path, {
+      method: "POST",
+      token: tenant.ownerToken,
+      body: { workspaceId: tenant.otherWorkspaceId, workflow: FLOW, fileType: "yaml" },
+    });
+    assert.deepEqual([other.status, other.body], [404, { error: "workspace_not_found", message: "Workspace not found" }], path);
+    assert.equal(cp.introspection.calls.at(-1)!.workspace, tenant.otherWorkspaceId, path);
+  }
   const missing = await cp.api("/api/v1/workflows/nope/nope", { token: tenant.memberToken });
   assert.deepEqual([missing.status, missing.body], [404, { error: "not_found", message: "Route not found" }]);
 });
@@ -201,14 +247,42 @@ test("finishing a run enqueues a durable revocation; the outbox retries until th
   assert.equal(cp.broker.calls.filter((c) => c.op === "revokeForRun").length, 3);
   assert.deepEqual(await outbox.drain(), { delivered: 0, failed: 0 });
 
-  // Enqueueing twice is a no-op; a broker 404 (nothing issued) counts as delivered.
+  // Enqueueing twice is a no-op. Only a 2xx deletes the row: a broker 404
+  // (wrong route or base URL) is retried with backoff and logged.
   await enqueueCredentialRevocation(cp.database, run.body.runId);
   await enqueueCredentialRevocation(cp.database, run.body.runId);
+  const goneLogger = new MemoryLogger();
   const gone = new RevokeOutbox({
     db: cp.database,
+    logger: goneLogger,
+    baseDelayMs: 0,
+    maxDelayMs: 0,
     broker: Object.assign(new FakeBroker(), { revokeForRun: async () => { throw new BrokerError(404, "not_found", "none"); } }),
   });
-  assert.deepEqual(await gone.drain(), { delivered: 1, failed: 0 });
+  assert.deepEqual(await gone.drain(), { delivered: 0, failed: 1 });
+  assert.deepEqual(await gone.drain(), { delivered: 0, failed: 1 });
+  const kept = await cp.database.query<{ attempts: number; last_error: string }>("SELECT attempts, last_error FROM selfhost_cli_credential_revocations");
+  assert.deepEqual(kept.rows.map((r) => [Number(r.attempts), r.last_error]), [[2, "not_found"]]);
+  assert.deepEqual(
+    goneLogger.named("flows_revoke_retry").map((e) => [e.status, e.reason]),
+    [[404, "not_found"], [404, "not_found"]],
+  );
+  assert.deepEqual(await outbox.drain(), { delivered: 1, failed: 0 }, "a later 2xx delivers it");
+
+  // A worker that dies mid-delivery leaves its lease; once it expires another
+  // worker redelivers the row.
+  await enqueueCredentialRevocation(cp.database, run.body.runId);
+  const stuck = new RevokeOutbox({
+    db: cp.database,
+    leaseMs: 50,
+    broker: Object.assign(new FakeBroker(), { revokeForRun: () => new Promise<void>(() => undefined) }),
+  });
+  void stuck.drain();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const second = new RevokeOutbox({ db: cp.database, broker: cp.broker });
+  assert.deepEqual(await second.drain(), { delivered: 0, failed: 0 }, "leased rows are hidden");
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.deepEqual(await second.drain(), { delivered: 1, failed: 0 }, "an expired lease is redelivered");
 });
 
 test("revoke backoff grows exponentially and is capped", () => {

@@ -1,3 +1,5 @@
+import { joinUrl } from "./http.ts";
+
 /**
  * Seams to relay-control for data that stays there after the Flows move:
  * subscription logins (CLI credentials) and each workspace's Relaycast
@@ -40,12 +42,10 @@ export type RelaycastCredentials = { relaycastWorkspaceId: string; relaycastApiK
 export type RelaycastCredentialSource = (workspaceId: string) => Promise<RelaycastCredentials>;
 
 /**
- * relay-control routes behind the seams.
- *
- * TODO(contract): these are placeholders until relay-control publishes the
- * Flows credential broker contract (issue reference, read, write back, revoke
- * for run, workspace Relaycast binding). Only this object changes when it
- * lands.
+ * relay-control's Flows credential broker routes (the contract): issue a run
+ * reference, read for a run, write back, revoke for a run (POST, JSON
+ * bodies) and the workspace Relaycast binding (GET). Every call carries
+ * `Authorization: Bearer <RELAYFILE_CONTROL_BROKER_SECRET>`.
  */
 export const BROKER_PATHS = {
   issueRunReference: "/internal/v1/flows/credentials/references",
@@ -64,6 +64,18 @@ export class BrokerError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
     super(message);
     this.name = "BrokerError";
+  }
+}
+
+/**
+ * relay-control refused the workspace's Relaycast binding (4xx): the
+ * workspace has no binding or this service is not authorized. Retrying does
+ * not help until an operator fixes the configuration.
+ */
+export class RelaycastBindingRefused extends Error {
+  constructor(readonly status: number, readonly code: string) {
+    super(`relay-control refused the relaycast binding (${status} ${code})`);
+    this.name = "RelaycastBindingRefused";
   }
 }
 
@@ -94,11 +106,10 @@ type HttpSeamOptions = {
 
 function seamCaller(options: HttpSeamOptions) {
   const fetcher = options.fetchImpl ?? fetch;
-  const base = options.baseUrl.replace(/\/+$/, "");
   return async (method: "GET" | "POST", path: string, body?: unknown): Promise<{ status: number; body: unknown }> => {
     let response: Response;
     try {
-      response = await fetcher(`${base}${path}`, {
+      response = await fetcher(joinUrl(options.baseUrl, path), {
         method,
         headers: {
           authorization: `Bearer ${options.secret}`,
@@ -163,6 +174,7 @@ export function httpRelaycastCredentialSource(options: HttpSeamOptions): Relayca
     try {
       result = await call("GET", paths.relaycastCredentials(workspaceId));
     } catch (error) {
+      if (error instanceof BrokerError) throw new RelaycastBindingRefused(error.status, error.code);
       throw new RelaycastCredentialsUnavailable(
         `relaycast credentials unavailable: ${error instanceof Error ? error.message : String(error)}`,
       );

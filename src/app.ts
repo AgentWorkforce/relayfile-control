@@ -15,6 +15,7 @@ import { QueueDepth } from "./queue/store.ts";
 import { FlowsAuthError } from "./flows/introspection.ts";
 import { createFlowsHandler, type FlowsUserAccess } from "./flows/routes.ts";
 import type { FlowsStore } from "./flows/store.ts";
+import { createInternalFlowsHandler } from "./flows/internal.ts";
 import { flowsTelemetry, presentedBearer, telemetrySecretMatches, TELEMETRY_FLOWS_PATH } from "./flows/telemetry.ts";
 
 /** The Flows API (README "Flows API"); absent = the Flows paths answer 404. */
@@ -122,6 +123,13 @@ export function createApp(deps: AppDeps): App {
     });
   }
 
+  if (deps.flows) deps.flows.store.logger ??= deps.logger;
+  const internalFlows = createInternalFlowsHandler({
+    store: deps.flows?.store,
+    runtimeVerifySecret: deps.config.RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET,
+    brokerSecret: deps.config.RELAYFILE_CONTROL_BROKER_SECRET,
+    logger: deps.logger,
+  });
   const flowsHandler = deps.flows
     ? createFlowsHandler({ store: deps.flows.store, publicBaseUrl: deps.flows.publicBaseUrl, userAccess: deps.flows.userAccess })
     : null;
@@ -182,6 +190,7 @@ export function createApp(deps: AppDeps): App {
       const url = new URL(req.url ?? "/", "http://localhost");
       if (await common(req, res, url)) return;
       if (await telemetry(req, res, url)) return;
+      if (await internalFlows(req, res, url.pathname)) return;
       if (await flows(req, res)) return;
       const ingress = deps.config.ROLE === "consumer" ? null : webhookIngressFor(url.pathname);
       if (ingress) return handleWebhook(req, res, ingress, ingressDeps, url);

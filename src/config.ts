@@ -42,14 +42,19 @@ export function parseOrigin(value: string): string | null {
   return url.origin;
 }
 
-const origin = z.string().transform((v, ctx) => {
-  const parsed = parseOrigin(v);
-  if (!parsed) {
-    ctx.addIssue({ code: "custom", message: "must be an absolute http(s) origin" });
-    return z.NEVER;
-  }
-  return parsed;
-});
+/** An optional http(s) origin (see parseOrigin); blank means unset. */
+const optionalOrigin = z
+  .string()
+  .optional()
+  .transform((v, ctx) => {
+    if (v === undefined || v.trim() === "") return undefined;
+    const parsed = parseOrigin(v);
+    if (!parsed) {
+      ctx.addIssue({ code: "custom", message: "must be an absolute http(s) origin" });
+      return z.NEVER;
+    }
+    return parsed;
+  });
 
 /** Shared secrets verified with a constant-time compare must carry at least 32 bytes. */
 const longSecret = optional.refine((v) => v === undefined || Buffer.byteLength(v, "utf8") >= 32, {
@@ -127,7 +132,8 @@ export const ConfigSchema = z.object({
   RELAYFILE_CONTROL_ADMIN_TOKEN: secrets,
 
   // §11 entitlement.
-  RELAYCONTROL_BASE_URL: optional,
+  /** relay-control's origin (entitlement, introspection and the Flows credential broker). */
+  RELAYCONTROL_BASE_URL: optionalOrigin,
   RELAYCONTROL_SERVICE_TOKEN: optional,
   RELAYCONTROL_LICENSE_DOC: optional,
   RELAYCONTROL_LICENSE_FILE: optional,
@@ -139,9 +145,9 @@ export const ConfigSchema = z.object({
   /**
    * This service's public origin. Sent as `aud` when introspecting
    * relay-control access tokens; relay-control must list it in
-   * SELFHOST_INTROSPECT_AUDIENCES.
+   * SELFHOST_INTROSPECT_AUDIENCES. Required when FLOWS_ENABLED.
    */
-  RELAYFILE_CONTROL_PUBLIC_ORIGIN: origin,
+  RELAYFILE_CONTROL_PUBLIC_ORIGIN: optionalOrigin,
   /**
    * The public URL users and workers reach the Flows routes at (worker
    * register/start commands, local-run `apiUrl`). The ingress routes the
@@ -166,12 +172,18 @@ export const ConfigSchema = z.object({
     }),
   /** Mounts the Flows routes and starts their background workers. */
   FLOWS_ENABLED: bool(false),
-  /** Bearer for relay-control POST /internal/v1/auth/introspect. */
-  RELAYCONTROL_INTROSPECT_SECRET: optional,
-  /** Sent as the bearer on every call to relay-control's Flows credential broker. */
-  RELAYFILE_CONTROL_BROKER_SECRET: optional,
+  /** Bearer for relay-control POST /internal/v1/auth/introspect (at least 32 bytes). */
+  RELAYCONTROL_INTROSPECT_SECRET: longSecret,
+  /**
+   * Sent as the bearer on every call to relay-control's Flows credential
+   * broker, and verified on DELETE /internal/v1/flows/workspaces/{id}
+   * (at least 32 bytes).
+   */
+  RELAYFILE_CONTROL_BROKER_SECRET: longSecret,
   /** Verified on GET /internal/v1/telemetry/flows. Unset disables the route (404). */
   RELAYFILE_CONTROL_TELEMETRY_SECRET: longSecret,
+  /** Verified on POST /internal/v1/flows/runtime-credentials/verify. Unset disables the route (404). */
+  RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET: longSecret,
   /** Keyring for run envSecrets at rest (AES-256-GCM; 32 bytes as hex or base64). */
   RELAYFILE_CONTROL_ENCRYPTION_KEY_ID: optional,
   RELAYFILE_CONTROL_ENCRYPTION_KEY: optional,
@@ -181,8 +193,23 @@ export const ConfigSchema = z.object({
   FLOWS_INTROSPECTION_CACHE_SECONDS: int(30, 0, 30),
   FLOWS_REVOKE_OUTBOX_INTERVAL_MS: int(5_000, 100, 3_600_000),
 }).superRefine((c, ctx) => {
+  // Each static shared secret authorizes a different caller; two equal values
+  // would let one caller act as the other.
+  const distinct = [
+    "RELAYCONTROL_INTROSPECT_SECRET",
+    "RELAYFILE_CONTROL_BROKER_SECRET",
+    "RELAYFILE_CONTROL_TELEMETRY_SECRET",
+    "RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET",
+  ] as const;
+  distinct.forEach((key, index) => {
+    const value = c[key];
+    if (value === undefined) return;
+    const twin = distinct.slice(0, index).find((other) => c[other] === value);
+    if (twin) ctx.addIssue({ code: "custom", path: [key], message: `must differ from ${twin}` });
+  });
   if (!c.FLOWS_ENABLED) return;
   const required: Array<keyof typeof c> = [
+    "RELAYFILE_CONTROL_PUBLIC_ORIGIN",
     "RELAYCONTROL_BASE_URL",
     "RELAYCONTROL_INTROSPECT_SECRET",
     "RELAYFILE_CONTROL_BROKER_SECRET",
@@ -201,6 +228,7 @@ export const FILE_SECRETS = [
   "RELAYCONTROL_INTROSPECT_SECRET",
   "RELAYFILE_CONTROL_BROKER_SECRET",
   "RELAYFILE_CONTROL_TELEMETRY_SECRET",
+  "RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET",
   "RELAYFILE_CONTROL_ENCRYPTION_KEY",
   "RELAYFILE_CONTROL_ENCRYPTION_PREVIOUS_KEY",
 ] as const;
@@ -251,6 +279,7 @@ const SECRET_KEYS = new Set<keyof Config>([
   "RELAYCONTROL_INTROSPECT_SECRET",
   "RELAYFILE_CONTROL_BROKER_SECRET",
   "RELAYFILE_CONTROL_TELEMETRY_SECRET",
+  "RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET",
   "RELAYFILE_CONTROL_ENCRYPTION_KEY",
   "RELAYFILE_CONTROL_ENCRYPTION_PREVIOUS_KEY",
 ]);
