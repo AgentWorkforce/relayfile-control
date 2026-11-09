@@ -160,6 +160,18 @@ test("relayfile credential verification table", () => {
       answer: { ...answer, scopes: relayfileScopesFor([ROOT, "/gitlab"], false) },
       expected: "scopes",
     },
+    {
+      name: "read-only grant for a read-write request (issuer and introspection agree)",
+      credential: { scopes: relayfileScopesFor(mountPaths, true) },
+      answer: { ...answer, scopes: relayfileScopesFor(mountPaths, true) },
+      expected: "scopes",
+    },
+    {
+      name: "grant wider than the mount paths (issuer and introspection agree)",
+      credential: { scopes: [...scopes, "relayfile:fs:read:/slack", "relayfile:fs:read:/slack/*"] },
+      answer: { ...answer, scopes: [...scopes, "relayfile:fs:read:/slack", "relayfile:fs:read:/slack/*"] },
+      expected: "scopes",
+    },
   ];
   for (const row of rows) {
     const issued = { ...credential, ...row.credential };
@@ -170,6 +182,7 @@ test("relayfile credential verification table", () => {
       workspaceId,
       relayfileOrigin: RELAYFILE_URL,
       requestedMountPaths: row.requested ?? mountPaths,
+      readOnly: false,
       nowMs,
     });
     assert.equal(actual, row.expected, row.name);
@@ -364,6 +377,40 @@ test("issued and verified: payload carries the credential, stored encrypted, reu
   );
   assert.equal(await s.revocations(runId), 1);
   assert.equal(s.refusedLogs().length, 0);
+  await assertNoTokenLeak(s.cp, runId);
+});
+
+test("stored credential past its TTL: re-issued on redelivery, no refusal, no event", async (t) => {
+  const s = await setup(t);
+  const runId = await s.startRun(yamlWith("integrations:\n  github: {}"));
+  const first = s.payloadOf(await s.claim());
+  const issuer = s.cp.relayfileIssuer;
+  assert.equal(issuer.calls.length, 1);
+  // A fresh credential (TTL far away) is still reused.
+  assert.equal(s.payloadOf((await s.cp.flows.unackedAssignments(s.worker.workerId))[0]!).relayfileToken, first.relayfileToken);
+  assert.equal(issuer.calls.length, 1);
+
+  for (const [name, offsetMs] of [["expired", -3_600_000], ["under the 60 s floor", 30_000]] as const) {
+    await s.cp.database.query(
+      "UPDATE selfhost_workflow_runs SET relayfile_credential_expires_at = $2 WHERE id = $1",
+      [runId, new Date(Date.now() + offsetMs).toISOString()],
+    );
+    const before: number = issuer.calls.length;
+    const again = s.payloadOf((await s.cp.flows.unackedAssignments(s.worker.workerId))[0]!);
+    assert.equal(issuer.calls.length, before + 1, `${name}: re-issued`);
+    assert.match(again.relayfileToken, /^sh_fr_/);
+    assert.notEqual(again.relayfileToken, first.relayfileToken, name);
+    assert.deepEqual(again.relayfileMountPaths, first.relayfileMountPaths, name);
+    assert.ok(Date.parse(again.relayfileTokenExpiresAt) > Date.now() + 3_600_000, name);
+    const row = await s.runRow(runId);
+    assert.equal(row.relayfile_credential_id, issuer.issued[before]!.credentialId, name);
+    assert.equal(new Date(row.relayfile_credential_expires_at).toISOString(), again.relayfileTokenExpiresAt, name);
+    assert.equal(row.relayfile_credential_refusal, null, name);
+  }
+  assert.deepEqual(await s.unavailable(runId), []);
+  assert.equal(await s.revocations(runId), 0, "run still live: revocation is the issuer's on re-issue");
+  assert.equal(s.refusedLogs().length, 0);
+  assert.equal(s.cp.app.logger.named("flows_relayfile_credential_reissue").length, 2);
   await assertNoTokenLeak(s.cp, runId);
 });
 

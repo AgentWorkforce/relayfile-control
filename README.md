@@ -159,9 +159,10 @@ check apply only to the secrets that are set.
   The answer is introspected with `aud` = the Relayfile origin and must be
   an active `agent` token named `flows-run-<runId>` for this credential id
   and workspace, expiring at least 60 s from now and matching
-  `relayfileTokenExpiresAt` within 1 s, with exactly the issued scopes, each
-  inside the mount paths. A verified credential is stored encrypted, reused
-  on redelivery (never re-issued for a live run), nulled when the run
+  `relayfileTokenExpiresAt` within 1 s, with exactly the scopes the mount
+  paths imply (read and write per path). A verified credential is stored
+  encrypted, reused on redelivery while at least 60 s of its TTL remain
+  (re-issued otherwise; the issuer revokes the earlier one), nulled when the run
   finishes, and revoked by the same outbox `revoke {runId}` row. The
   assignment payload then carries `relayfileToken`,
   `relayfileTokenExpiresAt` and `relayfileMountPaths`; otherwise those

@@ -1,6 +1,7 @@
 import { parseOrigin } from "../config.ts";
 import type { RelayfileCredential } from "./broker.ts";
 import type { Introspection } from "./introspection.ts";
+import { relayfileScopesFor } from "./relayfile-mount.ts";
 
 /**
  * Checks on a freshly issued per-run Relayfile credential before it is handed
@@ -33,8 +34,6 @@ export function relayfileOrigin(url: string): string | null {
   }
 }
 
-const SCOPE = /^relayfile:fs:(read|write):(.+)$/;
-
 function sameSet(a: readonly string[], b: readonly string[]): boolean {
   const left = new Set(a);
   const right = new Set(b);
@@ -55,6 +54,8 @@ export function verifyRelayfileCredential(input: {
   workspaceId: string;
   relayfileOrigin: string;
   requestedMountPaths: readonly string[];
+  /** What was asked of the issuer; the grant must be exactly this shape. */
+  readOnly: boolean;
   nowMs: number;
 }): string | null {
   const { credential, answer } = input;
@@ -73,12 +74,12 @@ export function verifyRelayfileCredential(input: {
   ) {
     return "expiry";
   }
-  if (answer.scopes.length === 0 || !sameSet(answer.scopes, credential.scopes)) return "scopes";
-  for (const scope of answer.scopes) {
-    const match = SCOPE.exec(scope);
-    const path = match?.[2];
-    if (!path || !credential.relayfileMountPaths.some((root) => path === root || path === `${root}/*`)) return "scopes";
-  }
+  // The grant must be exactly the set derived from the issued mount paths
+  // for the requested mode: the worker derives its expectations from
+  // `relayfileMountPaths`, so a narrower (read-only) or wider grant would
+  // only surface at Relayfile.
+  const expectedScopes = relayfileScopesFor(credential.relayfileMountPaths, input.readOnly);
+  if (!sameSet(answer.scopes, credential.scopes) || !sameSet(answer.scopes, expectedScopes)) return "scopes";
   // Compared as sets of the same size: the issuer may not keep the order.
   const issued = credential.relayfileMountPaths;
   if (issued.length !== input.requestedMountPaths.length || !sameSet(issued, input.requestedMountPaths)) return "mount_paths";

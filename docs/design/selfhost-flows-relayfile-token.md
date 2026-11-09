@@ -141,9 +141,12 @@ while the ciphertext is empty.
 
 - First call with the column empty: compute mount paths (§2.2), call the
   issuer, verify (§2.4), store, place the three fields in the payload.
-- Later calls: decrypt and reuse. Never re-issue for a live run; the
-  issuer's "re-issue revokes the previous" rule only matters if this
-  service crashed between issue and store, which then rotates harmlessly.
+- Later calls: decrypt and reuse while `relayfile_credential_expires_at`
+  is at least 60 s away. A run redelivered after the TTL (12 h default)
+  would otherwise hand the worker a dead token: the stale columns are
+  cleared and the credential is issued again; the issuer's "re-issue
+  revokes the previous" rule retires the old one, and run end revokes
+  whatever is current.
 - `finishRun` already enqueues `enqueueCredentialRevocation(tx, runId)`
   (`src/flows/revoke-outbox.ts`); the same outbox row now also revokes the
   Relayfile credential because relay-control's `revoke { runId }` covers
@@ -167,7 +170,7 @@ must satisfy every row:
 | `workspace` equals the run's relaycontrol workspace | `workspace` |
 | `aud` normalizes to this service's `SELFHOST_FLOWS_WORKER_RELAYFILE_URL` origin | `audience` |
 | `exp` at least 60 s in the future and equal to `relayfileTokenExpiresAt` within 1 s | `expiry` |
-| `scopes` equals the issuer's `scopes` and every scope is `relayfile:fs:(read|write):<p>` or `<p>/*` for `p` in `relayfileMountPaths` | `scopes` |
+| `scopes` equals the issuer's `scopes` and equals exactly `relayfileScopesFor(relayfileMountPaths, readOnly)` (read and write per mount path for a read-write request) | `scopes` |
 
 Raw tokens are never logged or cached beyond the existing sha256 cache key.
 A credential that fails verification is treated as unavailable (§2.5) and
