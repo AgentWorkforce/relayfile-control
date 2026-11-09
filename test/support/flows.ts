@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { Db } from "../../src/db/db.ts";
-import type { CliCredentialBroker, RelaycastCredentialSource } from "../../src/flows/broker.ts";
+import type { CliCredentialBroker, RelaycastCredentials, RelaycastCredentialSource } from "../../src/flows/broker.ts";
 import { defaultFlowsConfig, type FlowsConfig } from "../../src/flows/config.ts";
 import { flowsDatabase } from "../../src/flows/database.ts";
 import { introspectionUserAccess, type Introspection, type Introspector } from "../../src/flows/introspection.ts";
@@ -73,11 +73,12 @@ export class FakeBroker implements CliCredentialBroker {
   }
 }
 
-export function fakeRelaycast(keys: Map<string, string>): RelaycastCredentialSource {
+/** workspaceId -> the workspace's Relaycast binding (as relay-control holds it). */
+export function fakeRelaycast(bindings: Map<string, RelaycastCredentials>): RelaycastCredentialSource {
   return async (workspaceId) => {
-    const key = keys.get(workspaceId);
-    if (!key) throw new Error("no relaycast binding");
-    return { relaycastWorkspaceId: `rc-${workspaceId}`, relaycastApiKey: key };
+    const binding = bindings.get(workspaceId);
+    if (!binding) throw new Error("no relaycast binding");
+    return { ...binding };
   };
 }
 
@@ -122,7 +123,7 @@ export async function startControlPlane(flowsOverrides: Partial<FlowsConfig> = {
   const db: Db = await newPglite();
   const introspection = new FakeIntrospection();
   const broker = new FakeBroker();
-  const relaycastKeys = new Map<string, string>();
+  const relaycastKeys = new Map<string, RelaycastCredentials>();
   const flows = new FlowsStore(
     flowsDatabase(db),
     ENCRYPTION_KEYRING,
@@ -162,8 +163,8 @@ export async function seedTenant(cp: Awaited<ReturnType<typeof startControlPlane
   const otherWorkspaceId = randomUUID();
   const ownerId = randomUUID();
   const memberId = randomUUID();
-  cp.relaycastKeys.set(workspaceId, "rk_live_primary");
-  cp.relaycastKeys.set(otherWorkspaceId, "rk_live_other");
+  cp.relaycastKeys.set(workspaceId, { relaycastWorkspaceId: "rc-primary", relaycastApiKey: "rk_live_primary" });
+  cp.relaycastKeys.set(otherWorkspaceId, { relaycastWorkspaceId: "rc-other", relaycastApiKey: "rk_live_other" });
   const mint = cp.introspection.mint.bind(cp.introspection);
   const tenant = {
     organizationId,
