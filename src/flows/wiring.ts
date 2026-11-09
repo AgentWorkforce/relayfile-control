@@ -2,7 +2,7 @@ import type { FlowsDeps } from "../app.ts";
 import type { Config } from "../config.ts";
 import type { Db } from "../db/db.ts";
 import type { Logger } from "../observability/log.ts";
-import { httpCliCredentialBroker, httpRelaycastCredentialSource } from "./broker.ts";
+import { httpCliCredentialBroker, httpRelaycastCredentialSource, httpRelayfileCredentialBroker } from "./broker.ts";
 import { loadFlowsConfig } from "./config.ts";
 import type { EncryptionKey, EncryptionKeyring } from "./crypto.ts";
 import { flowsDatabase } from "./database.ts";
@@ -88,6 +88,7 @@ export function buildFlows(config: Config, db: Db, logger: Logger, env: NodeJS.P
   const seam = { baseUrl, secret: brokerSecret };
   store.cliCredentials = httpCliCredentialBroker(seam);
   store.relaycastCredentials = httpRelaycastCredentialSource(seam);
+  store.relayfileCredentials = httpRelayfileCredentialBroker(seam);
   store.logger = logger;
   const introspect = createIntrospector({
     baseUrl,
@@ -95,6 +96,8 @@ export function buildFlows(config: Config, db: Db, logger: Logger, env: NodeJS.P
     audience: publicOrigin,
     cacheSeconds: config.FLOWS_INTROSPECTION_CACHE_SECONDS,
   });
+  // Verifies each run's Relayfile credential (per-call audience: the Relayfile origin).
+  store.introspect = introspect;
   const outbox = new RevokeOutbox({ db, broker: store.cliCredentials, logger, intervalMs: config.FLOWS_REVOKE_OUTBOX_INTERVAL_MS });
   const publicBaseUrl = config.FLOWS_PUBLIC_BASE_URL ?? publicOrigin;
   return {

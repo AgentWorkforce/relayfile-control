@@ -52,6 +52,7 @@ export const BROKER_PATHS = {
   readForRun: "/internal/v1/flows/credentials/read",
   writeBack: "/internal/v1/flows/credentials/write-back",
   revokeForRun: "/internal/v1/flows/credentials/revoke",
+  issueRelayfileCredential: "/internal/v1/flows/credentials/relayfile",
   relaycastCredentials: (workspaceId: string) =>
     `/internal/v1/flows/credentials/workspaces/${encodeURIComponent(workspaceId)}/relaycast`,
 } as const;
@@ -76,6 +77,47 @@ export class RelaycastBindingRefused extends Error {
   constructor(readonly status: number, readonly code: string) {
     super(`relay-control refused the relaycast binding (${status} ${code})`);
     this.name = "RelaycastBindingRefused";
+  }
+}
+
+/**
+ * A per-run Relayfile credential issued by relay-control
+ * (POST /internal/v1/flows/credentials/relayfile, 200 body).
+ */
+export type RelayfileCredential = {
+  /** Opaque `sh_fr_` bearer. Never logged. */
+  relayfileToken: string;
+  relayfileTokenExpiresAt: string;
+  relayfileMountPaths: string[];
+  scopes: string[];
+  aud: string;
+  /** Equals the introspection `token_id`; safe to log. */
+  credentialId: string;
+};
+
+export type RelayfileCredentialRequest = {
+  workspaceId: string;
+  runId: string;
+  mountPaths: string[];
+  readOnly?: boolean;
+  aud: string;
+};
+
+/**
+ * Issues the run's Relayfile credential. Throws `RelayfileCredentialRefused`
+ * for a 4xx and `BrokerUnavailable` for a 5xx, a network failure or a
+ * malformed answer. revoke `{runId}` (CliCredentialBroker.revokeForRun) also
+ * revokes it.
+ */
+export type RelayfileCredentialBroker = {
+  issue(input: RelayfileCredentialRequest): Promise<RelayfileCredential>;
+};
+
+/** relay-control refused to issue the run's Relayfile credential (4xx `{error, message}`). */
+export class RelayfileCredentialRefused extends Error {
+  constructor(readonly status: number, readonly code: string, message: string) {
+    super(message);
+    this.name = "RelayfileCredentialRefused";
   }
 }
 
@@ -184,5 +226,55 @@ export function httpRelaycastCredentialSource(options: HttpSeamOptions): Relayca
       throw new RelaycastCredentialsUnavailable("relaycast credentials response is malformed");
     }
     return { relaycastWorkspaceId: body.relaycastWorkspaceId, relaycastApiKey: body.relaycastApiKey };
+  };
+}
+
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function stringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length > 0 && value.every((entry) => typeof entry === "string" && entry.length > 0);
+}
+
+/** Strict shape check of the issue answer; null when malformed. */
+export function parseRelayfileCredential(body: unknown): RelayfileCredential | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const b = body as Record<string, unknown>;
+  if (typeof b.relayfileToken !== "string" || !/^sh_fr_\S+$/.test(b.relayfileToken)) return null;
+  if (typeof b.relayfileTokenExpiresAt !== "string" || !Number.isFinite(Date.parse(b.relayfileTokenExpiresAt))) return null;
+  if (!stringArray(b.relayfileMountPaths) || !stringArray(b.scopes)) return null;
+  if (typeof b.aud !== "string" || !b.aud) return null;
+  if (typeof b.credentialId !== "string" || !UUID_SHAPE.test(b.credentialId)) return null;
+  return {
+    relayfileToken: b.relayfileToken,
+    relayfileTokenExpiresAt: b.relayfileTokenExpiresAt,
+    relayfileMountPaths: [...b.relayfileMountPaths],
+    scopes: [...b.scopes],
+    aud: b.aud,
+    credentialId: b.credentialId,
+  };
+}
+
+export function httpRelayfileCredentialBroker(options: HttpSeamOptions): RelayfileCredentialBroker {
+  const call = seamCaller(options);
+  const paths = options.paths ?? BROKER_PATHS;
+  return {
+    async issue(input) {
+      let result: { body: unknown };
+      try {
+        result = await call("POST", paths.issueRelayfileCredential, {
+          workspaceId: input.workspaceId,
+          runId: input.runId,
+          mountPaths: input.mountPaths,
+          ...(input.readOnly !== undefined ? { readOnly: input.readOnly } : {}),
+          aud: input.aud,
+        });
+      } catch (error) {
+        if (error instanceof BrokerError) throw new RelayfileCredentialRefused(error.status, error.code, error.message);
+        throw error;
+      }
+      const credential = parseRelayfileCredential(result.body);
+      if (!credential) throw new BrokerUnavailable("relayfile credential response is malformed");
+      return credential;
+    },
   };
 }

@@ -430,6 +430,20 @@ paths:
         WorkAssignment); `event: revoke` then close. Assigned but
         unacknowledged work is redelivered on reconnect. A worker holds at
         most one assigned/running assignment at a time.
+
+        The assignment's workflow payload carries `relayfileUrl` whenever
+        SELFHOST_FLOWS_WORKER_RELAYFILE_URL is set. `relayfileToken` (an
+        `sh_fr_` per-run credential), `relayfileTokenExpiresAt` (ISO 8601)
+        and `relayfileMountPaths` (the run root `/workflows/runs/<runId>`
+        first, then the workflow's provider roots, sorted) are present only
+        when relay-control issued the credential and this service verified
+        it; they are never empty strings. The credential is issued once per
+        run, reused on redelivery, and revoked when the run finishes. When
+        it is absent the run carries one `run.relayfile_credential_unavailable`
+        event `{ code, reason? }`; codes: `relayfile_not_configured`,
+        `workspace_not_found`, `relayfile_audience_not_accepted`,
+        `invalid_mount_paths`, `invalid_request`,
+        `relayfile_credential_invalid`, `unknown_refusal:<status>`.
       responses:
         "200":
           description: Event stream
@@ -936,7 +950,7 @@ paths:
             enum: [asc, desc]
       responses:
         "200":
-          description: Control-plane lifecycle events (run.queued, run.assigned, run.acknowledged, run.running, run.completed|failed|cancelled) plus mirrored runtime events
+          description: Control-plane lifecycle events (run.queued, run.relayfile_credential_unavailable, run.assigned, run.acknowledged, run.running, run.completed|failed|cancelled) plus mirrored runtime events
     post:
       tags: [run-ingestion]
       operationId: appendRunEvent

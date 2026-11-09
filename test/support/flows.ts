@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { Db } from "../../src/db/db.ts";
-import type { CliCredentialBroker, RelaycastCredentials, RelaycastCredentialSource } from "../../src/flows/broker.ts";
+import {
+  BrokerUnavailable,
+  RelayfileCredentialRefused,
+  type CliCredentialBroker,
+  type RelaycastCredentials,
+  type RelaycastCredentialSource,
+  type RelayfileCredential,
+  type RelayfileCredentialBroker,
+  type RelayfileCredentialRequest,
+} from "../../src/flows/broker.ts";
+import { relayfileScopesFor } from "../../src/flows/relayfile-mount.ts";
 import { defaultFlowsConfig, type FlowsConfig } from "../../src/flows/config.ts";
 import { flowsDatabase } from "../../src/flows/database.ts";
 import {
@@ -28,7 +38,7 @@ export const RELAYCONTROL_URL = "http://relay-control.test";
  */
 export class FakeIntrospection {
   readonly tokens = new Map<string, Introspection>();
-  readonly calls: Array<{ token: string; workspace?: string }> = [];
+  readonly calls: Array<{ token: string; workspace?: string; audience?: string }> = [];
   /** When set, the endpoint answers this status instead (an outage). */
   failWith: number | null = null;
 
@@ -51,6 +61,39 @@ export class FakeIntrospection {
     return token;
   }
 
+  /**
+   * A run's Relayfile credential as relay-control answers for it: an active
+   * `agent` answer named `flows-run-<runId>`, `email`/`machine_id` null.
+   */
+  mintRelayfile(input: {
+    runId: string;
+    workspaceId: string;
+    credentialId: string;
+    scopes: string[];
+    aud: string;
+    exp: number;
+    overrides?: Record<string, unknown>;
+  }): string {
+    const token = `sh_fr_${randomBytes(24).toString("hex")}`;
+    this.tokens.set(token, {
+      active: true,
+      sub: input.credentialId,
+      email: null,
+      machine_id: null,
+      principal_type: "agent",
+      agent_name: `flows-run-${input.runId}`,
+      org: randomUUID(),
+      workspace: input.workspaceId,
+      scopes: input.scopes,
+      exp: input.exp,
+      aud: input.aud,
+      iat: Math.floor(Date.now() / 1000),
+      token_id: input.credentialId,
+      ...input.overrides,
+    } as Introspection);
+    return token;
+  }
+
   /** Changes fields of a minted token's answer. */
   patch(token: string, fields: Record<string, unknown>): void {
     const answer = this.tokens.get(token);
@@ -58,8 +101,8 @@ export class FakeIntrospection {
     this.tokens.set(token, { ...answer, ...fields } as Introspection);
   }
 
-  readonly introspect: Introspector = async (token, workspace) => {
-    this.calls.push({ token, ...(workspace !== undefined ? { workspace } : {}) });
+  readonly introspect: Introspector = async (token, workspace, audience) => {
+    this.calls.push({ token, ...(workspace !== undefined ? { workspace } : {}), ...(audience !== undefined ? { audience } : {}) });
     const answer = this.tokens.get(token) ?? { active: false, reason: "unknown" };
     if (answer.active && workspace !== undefined && workspace !== answer.workspace) return { active: false, reason: "workspace" };
     return answer;
@@ -67,8 +110,8 @@ export class FakeIntrospection {
 
   readonly fetch: typeof fetch = async (_input, init) => {
     if (this.failWith !== null) return new Response("{}", { status: this.failWith });
-    const body = JSON.parse(String(init?.body)) as { token: string; workspace?: string };
-    return Response.json(await this.introspect(body.token, body.workspace));
+    const body = JSON.parse(String(init?.body)) as { token: string; workspace?: string; aud?: string };
+    return Response.json(await this.introspect(body.token, body.workspace, body.aud));
   };
 }
 
@@ -100,6 +143,53 @@ export class FakeBroker implements CliCredentialBroker {
       this.revokeFailures -= 1;
       throw new Error("broker down");
     }
+  }
+}
+
+/**
+ * Fake relay-control Relayfile credential issuer. `mode` programs the next
+ * answers: success (a token minted into the fake introspection, with
+ * `answerOverrides` applied to its introspection answer and `bodyOverrides`
+ * to the 200 body), a 4xx refusal, or an outage.
+ */
+export class FakeRelayfileCredentialBroker implements RelayfileCredentialBroker {
+  readonly calls: RelayfileCredentialRequest[] = [];
+  /** Every token issued (for leak assertions). */
+  readonly issued: RelayfileCredential[] = [];
+  mode: { kind: "success" } | { kind: "refuse"; status: number; code: string } | { kind: "outage" } = { kind: "success" };
+  answerOverrides: Record<string, unknown> = {};
+  bodyOverrides: Partial<RelayfileCredential> = {};
+  ttlSeconds = 12 * 3600;
+
+  constructor(private readonly introspection: FakeIntrospection) {}
+
+  async issue(input: RelayfileCredentialRequest): Promise<RelayfileCredential> {
+    this.calls.push(structuredClone(input));
+    if (this.mode.kind === "outage") throw new BrokerUnavailable("relay-control answered 503");
+    if (this.mode.kind === "refuse") throw new RelayfileCredentialRefused(this.mode.status, this.mode.code, "refused");
+    const credentialId = randomUUID();
+    const exp = Math.floor(Date.now() / 1000) + this.ttlSeconds;
+    const scopes = relayfileScopesFor(input.mountPaths, input.readOnly ?? false);
+    const relayfileToken = this.introspection.mintRelayfile({
+      runId: input.runId,
+      workspaceId: input.workspaceId,
+      credentialId,
+      scopes,
+      aud: input.aud,
+      exp,
+      overrides: this.answerOverrides,
+    });
+    const credential: RelayfileCredential = {
+      relayfileToken,
+      relayfileTokenExpiresAt: new Date(exp * 1000).toISOString(),
+      relayfileMountPaths: [...input.mountPaths],
+      scopes,
+      aud: input.aud,
+      credentialId,
+      ...this.bodyOverrides,
+    };
+    this.issued.push(credential);
+    return credential;
   }
 }
 
@@ -165,6 +255,8 @@ export async function startControlPlane(
   );
   flows.cliCredentials = broker;
   flows.relaycastCredentials = fakeRelaycast(relaycastKeys);
+  const relayfileIssuer = new FakeRelayfileCredentialBroker(introspection);
+  flows.relayfileCredentials = relayfileIssuer;
   const introspect = createIntrospector({
     baseUrl: RELAYCONTROL_URL,
     secret: "i".repeat(32),
@@ -172,6 +264,7 @@ export async function startControlPlane(
     cacheSeconds: 0,
     fetchImpl: introspection.fetch,
   });
+  flows.introspect = introspect;
   const app = await startApp({
     db,
     config: fixtureConfig(configOverrides),
@@ -186,6 +279,7 @@ export async function startControlPlane(
     flows,
     introspection,
     broker,
+    relayfileIssuer,
     relaycastKeys,
     origin: app.url,
     api: apiClient(app.url),
