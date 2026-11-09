@@ -45,7 +45,7 @@ Every setting is an environment variable with a finite default; see
 | `GITHUB_WEBHOOK_SECRET`, `NANGO_WEBHOOK_SECRET`, `HOOKDECK_WEBHOOK_SECRET`, `DROPBOX_APP_SECRET`, `SLACK_SIGNING_SECRET`, `LINEAR_WEBHOOK_SECRET` | per-ingress secrets; comma lists allow rotation. An unset secret makes its ingress answer `503 ingress_not_configured` |
 | `RELAYFILE_BASE_URL`, `RELAYFILE_INTERNAL_HMAC_SECRET` | Relayfile target and the internal HMAC secret (same Secret as the Relayfile server) |
 | `RELAYFILE_CONTROL_ADMIN_TOKEN` | admin bearer (comma list for rotation) |
-| `RELAYFILE_CONTROL_PUBLIC_ORIGIN` | this service's absolute http(s) origin (no path, query or credentials); the audience it asks relay-control to check tokens against |
+| `RELAYFILE_CONTROL_PUBLIC_ORIGIN` | optional at startup; required when `FLOWS_ENABLED=true`. This service's absolute http(s) origin (no path, query or credentials); the audience it asks relay-control to check tokens against |
 | `RELAYCONTROL_BASE_URL` + `RELAYCONTROL_SERVICE_TOKEN`, or `RELAYCONTROL_LICENSE_DOC` / `RELAYCONTROL_LICENSE_FILE` + `RELAYCONTROL_LICENSE_PUBLIC_KEY` | entitlement. Without the `relayfile` capability, ingress answers `403 feature_not_licensed` and the consumer pauses |
 
 Backpressure is cloud#6175 final by default. Relayfile 429 gets one in-place
@@ -75,10 +75,10 @@ required:
 
 | Variable | Purpose |
 |---|---|
-| `RELAYFILE_CONTROL_PUBLIC_ORIGIN` | audience (`aud`) sent with every introspection request |
-| `RELAYCONTROL_BASE_URL` | relay-control, for introspection and the credential broker |
-| `RELAYCONTROL_INTROSPECT_SECRET` | bearer for relay-control's introspection endpoint |
-| `RELAYFILE_CONTROL_BROKER_SECRET` | sent as `Authorization: Bearer` on every credential-broker call to relay-control |
+| `RELAYFILE_CONTROL_PUBLIC_ORIGIN` | audience (`aud`) sent with every introspection request and checked on every answer |
+| `RELAYCONTROL_BASE_URL` | relay-control's origin (no path, query or credentials), for introspection and the credential broker |
+| `RELAYCONTROL_INTROSPECT_SECRET` | at least 32 bytes; bearer for relay-control's introspection endpoint |
+| `RELAYFILE_CONTROL_BROKER_SECRET` | at least 32 bytes; sent as `Authorization: Bearer` on every credential-broker call to relay-control, and accepted on `DELETE /internal/v1/flows/workspaces/{id}` |
 | `RELAYFILE_CONTROL_ENCRYPTION_KEY_ID`, `RELAYFILE_CONTROL_ENCRYPTION_KEY` | key for run secrets and worker tokens at rest (32 bytes, hex or base64); `_PREVIOUS_KEY_ID` / `_PREVIOUS_KEY` keep the old key readable during rotation |
 | `SELFHOST_FLOWS_WORKER_RELAYCAST_URL` or `RELAYCAST_PUBLIC_URL` | the Relaycast URL workers are told to use |
 
@@ -87,6 +87,7 @@ Optional:
 | Variable | Default | Effect |
 |---|---|---|
 | `RELAYFILE_CONTROL_TELEMETRY_SECRET` | unset | at least 32 bytes; enables `GET /internal/v1/telemetry/flows` (unset: 404) |
+| `RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET` | unset | at least 32 bytes; enables `POST /internal/v1/flows/runtime-credentials/verify` (unset: 404) |
 | `FLOWS_PUBLIC_BASE_URL` | the public origin | base URL put into links the API returns |
 | `FLOWS_INTROSPECTION_CACHE_SECONDS` | 30 | introspection cache lifetime, capped at 30 |
 | `FLOWS_REVOKE_OUTBOX_INTERVAL_MS` | 5000 | how often the revocation outbox is drained |
@@ -94,7 +95,9 @@ Optional:
 | `SELFHOST_FLOWS_WORKER_RELAYFILE_URL`, `SELFHOST_DASHBOARD_URL`, `SELFHOST_FLOWS_QUEUE_WAIT_MS`, `SELFHOST_FLOWS_ENROLLMENT_TTL_MS`, `SELFHOST_FLOWS_QUEUE_PING_MS` | as before | same meaning as in relay-control |
 
 Every secret above can also be given as a file path in `<NAME>_FILE`.
-Setting both the value and `_FILE` is a configuration error.
+Setting both the value and `_FILE` is a configuration error. The
+introspection, broker, telemetry and runtime-verify secrets must all differ;
+startup refuses two equal values.
 
 ### Seams
 
@@ -103,32 +106,71 @@ Setting both the value and `_FILE` is a configuration error.
   `POST /internal/v1/auth/introspect` with
   `aud = RELAYFILE_CONTROL_PUBLIC_ORIGIN`. Only active `desktop-user` answers
   authenticate. User, workspace and organization ids are relay-control ids;
-  admin routes require the `owner` or `admin` role. Answers are cached for
-  at most 30 s (and never past `exp`), keyed by a hash of the token. Raw
-  tokens are never stored.
+  admin routes require the `owner` or `admin` role. A route that names a
+  workspace sends it too, and relay-control answers inactive unless it is
+  the token's (404 `workspace_not_found`). `aud`, `exp` and `iat` (60 s
+  skew) are also checked locally; a failing answer is a 401. Answers are
+  cached for at most 30 s (and never past `exp`), keyed by a hash of the
+  token. Raw tokens are never stored. If relay-control cannot be asked
+  (unreachable, timeout, non-200), the route answers
+  503 `auth_unavailable`.
+- **Cookie CSRF.** A cookie-authenticated `/cloud` request other than GET
+  must be `application/json` and carry an allowed `Origin` (the public
+  origin, `FLOWS_PUBLIC_BASE_URL` or the dashboard URL; never `null`) or
+  `Sec-Fetch-Site: same-origin`. Otherwise it answers 403 `csrf_rejected`,
+  as relay-control did. Bearer requests are not affected. Raw storage PUTs
+  therefore need a bearer.
 - **CliCredentialBroker (worker CLI logins).** The operations are
   `issueRunReference`, `readForRun`, `writeBack` and `revokeForRun`, plus the
   workspace Relaycast binding. All of them are HTTP calls to relay-control
-  carrying `RELAYFILE_CONTROL_BROKER_SECRET`. The paths are kept in one
-  object (`BROKER_PATHS` in `src/flows/broker.ts`) under
-  `/internal/v1/flows/credentials/...` until relay-control publishes the
-  contract. Each call sends both the run id and the reference; relay-control
-  enforces the binding between them. Finishing a run writes a row to the
-  `selfhost_cli_credential_revocations` outbox in the same transaction. A
-  worker delivers it with `revokeForRun` and retries with capped exponential
-  backoff until relay-control accepts it.
+  carrying `RELAYFILE_CONTROL_BROKER_SECRET`; `BROKER_PATHS` in
+  `src/flows/broker.ts` is the contract:
+
+  | Call | Route on relay-control | Body |
+  |---|---|---|
+  | issue run reference | `POST /internal/v1/flows/credentials/references` | `{workspaceId, runId}`; 204 or `null` = no logins |
+  | read for run | `POST /internal/v1/flows/credentials/read` | `{ref, runId}` |
+  | write back | `POST /internal/v1/flows/credentials/write-back` | `{ref, runId, credentialId, content}` |
+  | revoke for run | `POST /internal/v1/flows/credentials/revoke` | `{runId}` |
+  | Relaycast binding | `GET /internal/v1/flows/credentials/workspaces/{id}/relaycast` | none |
+
+  Each call sends both the run id and the reference; relay-control enforces
+  the binding between them. A 4xx `{error, message}` is a refusal; a 5xx or
+  network failure is an outage. On worker routes a refusal is passed
+  through, except 401/403 (this service's secret was refused), which
+  answers 502 `credential_broker_rejected`. A refused Relaycast binding is
+  a configuration error: the claim is released, one
+  `flows_relaycast_binding_refused` event is logged and the workspace's
+  queued runs are not offered again for 60 s. Finishing a run writes a row
+  to the `selfhost_cli_credential_revocations` outbox in the same
+  transaction. A worker delivers it with `revokeForRun`; only a 2xx removes
+  the row, and anything else (including 404) is retried with capped
+  exponential backoff.
 - **Telemetry.** relay-control calls `GET /internal/v1/telemetry/flows` with
   `Authorization: Bearer <RELAYFILE_CONTROL_TELEMETRY_SECRET>`. The secret
   is compared in constant time. The response is
   `{runs_by_status, workers_by_status, flow_definitions}`.
+- **Runtime credential verify.** relay-control calls
+  `POST /internal/v1/flows/runtime-credentials/verify` with
+  `Authorization: Bearer <RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET>` and
+  `{"token": "<worker credential>"}`. A live worker credential answers
+  `{active: true, subject: "worker:<id>", workspaceId, scopes}`; anything
+  else answers `{active: false}`.
+- **Workspace delete.** relay-control calls
+  `DELETE /internal/v1/flows/workspaces/{id}` with the broker secret when it
+  deletes a workspace. It removes the workspace's flows, runs (with their
+  secrets, events, steps, assignments and stored objects), workers and
+  enrollment tokens, and queues CLI-credential revocations for its runs, in
+  one transaction. It is idempotent: a repeat answers 200 with zero counts.
+  With GCS storage the bucket objects are not removed.
 
 ### Migration
 
 `migrations/0002_flows.sql` creates the Flows tables and the revocation
 outbox. The user, workspace, organization and credential-reference columns
 hold relay-control ids that were validated through introspection, so they
-have no foreign keys. Deleting a workspace in relay-control does not cascade
-here.
+have no foreign keys. Deleting a workspace in relay-control reaches this
+service through the internal workspace delete route, not a foreign key.
 
 ## Development
 

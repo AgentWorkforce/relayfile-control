@@ -1072,17 +1072,87 @@ paths:
                   flow_definitions: { type: integer }
         "401": { description: "unauthorized (missing or wrong secret)" }
         "404": { description: "not_found (RELAYFILE_CONTROL_TELEMETRY_SECRET unset)" }
+  /internal/v1/flows/runtime-credentials/verify:
+    post:
+      summary: Verify a worker credential for relay-control's runtime-environment route
+      description: |
+        Authenticated by RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET (constant-time
+        compare). 404 when the secret is not configured. The credential is
+        never echoed or logged.
+      security: [{ runtimeVerifySecret: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string, description: "a worker credential (`sh_wrk_`)" }
+      responses:
+        "200":
+          description: "`active: true` with the worker's subject, workspace and scopes for a live worker credential; otherwise `{active: false}`"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [active]
+                properties:
+                  active: { type: boolean }
+                  subject: { type: string, example: "worker:00000000-0000-0000-0000-000000000000" }
+                  workspaceId: { type: string, format: uuid }
+                  scopes: { type: array, items: { type: string } }
+        "400": { description: "invalid_request (missing token or malformed body)" }
+        "401": { description: "unauthorized (missing or wrong secret)" }
+        "404": { description: "not_found (RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET unset)" }
+        "405": { description: "method_not_allowed" }
+  /internal/v1/flows/workspaces/{workspaceId}:
+    delete:
+      summary: Delete a workspace's Flows data
+      description: |
+        Called by relay-control when it deletes a workspace. Authenticated by
+        RELAYFILE_CONTROL_BROKER_SECRET (constant-time compare); 404 when it
+        is not configured. Deletes flows, runs (with secrets, events, steps,
+        assignments and stored objects), workers and enrollment tokens, and
+        queues CLI-credential revocations for the runs, in one transaction.
+        Idempotent: a repeat answers 200 with zero counts.
+      security: [{ brokerSecret: [] }]
+      parameters:
+        - { name: workspaceId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Counts deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [workspaceId, deleted]
+                properties:
+                  workspaceId: { type: string, format: uuid }
+                  deleted:
+                    type: object
+                    required: [flows, runs, workers, enrollmentTokens, revocationsQueued]
+                    properties:
+                      flows: { type: integer }
+                      runs: { type: integer }
+                      workers: { type: integer }
+                      enrollmentTokens: { type: integer }
+                      revocationsQueued: { type: integer }
+        "400": { description: "invalid_request (workspace id is not a UUID)" }
+        "401": { description: "unauthorized (missing or wrong secret)" }
+        "404": { description: "not_found (RELAYFILE_CONTROL_BROKER_SECRET unset)" }
+        "405": { description: "method_not_allowed" }
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
-      description: relay-control user access token (`sh_at_`), verified through relay-control POST /internal/v1/auth/introspect.
+      description: relay-control user access token (`sh_at_`), verified through relay-control POST /internal/v1/auth/introspect. When relay-control cannot be asked the route answers 503 `auth_unavailable`.
     cookieAuth:
       type: apiKey
       in: cookie
       name: agent_relay_session
-      description: relay-control's session cookie; accepted only under `/cloud/api/v1/*`.
+      description: "relay-control's session cookie; accepted only under `/cloud/api/v1/*`. A cookie-authenticated request other than GET must be `application/json` with an allowed `Origin` (or `Sec-Fetch-Site` same-origin), else 403 `csrf_rejected`."
     workerToken:
       type: http
       scheme: bearer
@@ -1095,6 +1165,14 @@ components:
       type: http
       scheme: bearer
       description: RELAYFILE_CONTROL_TELEMETRY_SECRET, sent by relay-control.
+    runtimeVerifySecret:
+      type: http
+      scheme: bearer
+      description: RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET, sent by relay-control.
+    brokerSecret:
+      type: http
+      scheme: bearer
+      description: RELAYFILE_CONTROL_BROKER_SECRET, sent by relay-control.
     admin:
       type: http
       scheme: bearer
