@@ -1,5 +1,4 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { Principal } from "../store.js";
 import { MAX_OBJECT_BYTES, validateObjectKey } from "./objects.ts";
 import {
   cleanTags,
@@ -10,12 +9,28 @@ import {
 
 type JsonObject = Record<string, unknown>;
 
+/**
+ * The authenticated user as relay-control's introspection answer describes
+ * it. Every id is a relay-control id; this service holds no user or
+ * workspace rows of its own.
+ */
+export type Principal = {
+  userId: string;
+  email: string;
+  organizationId: string;
+  workspaceId: string;
+  role: "owner" | "admin" | "member";
+  scopes: string[];
+  tokenId: string;
+  expiresAt: number;
+};
+
 export type FlowsUserAccess = (
   request: IncomingMessage,
   admin?: boolean,
 ) => Promise<{
   principal: Principal;
-  workspace: { id: string; organizationId: string; name: string; role: Principal["role"] };
+  workspace: { id: string; organizationId: string; role: Principal["role"] };
 }>;
 
 const JSON_LIMIT = 4 * 1024 * 1024;
@@ -435,6 +450,7 @@ export function createFlowsHandler(deps: {
         const created = await store.createEnrollmentToken({
           workspaceId: access.workspace.id,
           userId: access.principal.userId,
+          userEmail: access.principal.email,
           name,
           tags: cleanTags(body.tags),
           ttlMs: typeof expiresInMinutes === "number" ? expiresInMinutes * 60_000 : undefined,
@@ -549,6 +565,7 @@ export function createFlowsHandler(deps: {
       const created = await store.createRun({
         workspaceId: access.workspace.id,
         userId: access.principal.userId,
+        userEmail: access.principal.email,
         flowId: flow.id,
         workflow: flow.source,
         fileType: flow.fileType,
@@ -582,6 +599,7 @@ export function createFlowsHandler(deps: {
         const resumed = await store.resumeRun({
           workspaceId: access.workspace.id,
           userId: access.principal.userId,
+          userEmail: access.principal.email,
           runId: resume,
           mode: "resume",
           startFrom: str(body, "startFrom", false, 256),
@@ -592,6 +610,7 @@ export function createFlowsHandler(deps: {
       const created = await store.createRun({
         workspaceId: access.workspace.id,
         userId: access.principal.userId,
+        userEmail: access.principal.email,
         flowId: flow?.id ?? null,
         workflow: flow?.source ?? str(body, "workflow", true, 262_144),
         fileType: flow?.fileType ?? fileTypeOf(body.fileType),
@@ -637,6 +656,7 @@ export function createFlowsHandler(deps: {
       const created = await store.createRun({
         workspaceId: access.workspace.id,
         userId: access.principal.userId,
+        userEmail: access.principal.email,
         workflow: str(body, "workflow", true, 262_144),
         fileType: fileTypeOf(body.fileType),
         dispatchType: "local",
@@ -700,6 +720,7 @@ export function createFlowsHandler(deps: {
       const resumed = await store.resumeRun({
         workspaceId: access.workspace.id,
         userId: access.principal.userId,
+        userEmail: access.principal.email,
         runId: params[0]!,
         mode: params[1] === "retry" || body.mode === "retry" ? "retry" : "resume",
         startFrom: str(body, "startFrom", false, 256),

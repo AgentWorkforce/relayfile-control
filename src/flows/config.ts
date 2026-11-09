@@ -1,35 +1,7 @@
-import { readFileSync } from "node:fs";
 import { GcsBackend, InlinePostgresBackend, type BlobBackend } from "./objects.ts";
-import { httpRuntimeEnvironmentSource, type RuntimeEnvironmentSource } from "./runtime-env.ts";
+import type { RuntimeEnvironmentSource } from "./runtime-env.ts";
 
 type Env = Record<string, string | undefined>;
-
-/**
- * Subscription logins (Codex/Grok auth files) for a run, provided in-process by
- * the admin module's SubscriptionLoginStore. The assignment payload carries
- * only a short-lived reference; the worker exchanges it, with its own worker
- * credential, for the files at GET .../assignments/{runId}/cli-credentials.
- */
-export type CliCredentialBroker = {
-  issueRunReference(workspaceId: string, runId: string): Promise<{
-    ref: string;
-    expiresAt: string;
-    credentials: Array<{ credentialId: string; provider: string; cli: string }>;
-  } | null>;
-  readForRun(ref: string | null, runId: string): Promise<{
-    files: Array<{
-      credentialId: string;
-      provider: string;
-      cli: string;
-      homeEnv: string;
-      directory: string;
-      file: string;
-      content: string;
-    }>;
-    skipped: Array<{ credentialId: string; reason: string }>;
-  }>;
-  writeBack(ref: string | null, runId: string, credentialId: string, content: unknown): Promise<{ updated: boolean }>;
-};
 
 export type FlowsConfig = {
   /** Relaycast origin handed to workers in the assignment payload. */
@@ -52,18 +24,13 @@ export type FlowsConfig = {
   storage: BlobBackend;
   /**
    * Workspace env vars and integration tokens merged into each assignment
-   * payload at delivery time (admin lane internal runtime contract).
+   * payload at delivery time (admin lane internal runtime contract). Not
+   * wired yet: the relay-control route behind it is authenticated with a
+   * secret this service must not hold; unset means runs carry only their
+   * own envSecrets, as on an installation without the admin module.
    */
   runtimeEnvironment?: RuntimeEnvironmentSource;
 };
-
-function secret(env: Env, name: string): string | undefined {
-  const direct = env[name]?.trim();
-  const file = env[`${name}_FILE`]?.trim();
-  if (direct && file) throw new Error(`${name} and ${name}_FILE are mutually exclusive`);
-  if (direct) return direct;
-  return file ? readFileSync(file, "utf8").trim() || undefined : undefined;
-}
 
 function origin(env: Env, name: string): string | undefined {
   const value = env[name]?.trim();
@@ -121,14 +88,6 @@ export function loadFlowsConfig(env: Env = process.env): FlowsConfig {
     throw new Error("SELFHOST_FLOWS_STORAGE must be postgres or gcs");
   }
   const dashboardUrl = origin(env, "SELFHOST_DASHBOARD_URL");
-  const internalToken = secret(env, "SELFHOST_INTERNAL_TOKEN");
-  const runtimeEnvironment = internalToken
-    ? httpRuntimeEnvironmentSource({
-      baseUrl: origin(env, "SELFHOST_FLOWS_RUNTIME_ENV_URL") ??
-        `http://127.0.0.1:${env.PORT?.trim() || "3000"}`,
-      token: internalToken,
-    })
-    : undefined;
   return defaultFlowsConfig({
     workerRelaycastUrl: origin(env, "SELFHOST_FLOWS_WORKER_RELAYCAST_URL"),
     workerRelayfileUrl: origin(env, "SELFHOST_FLOWS_WORKER_RELAYFILE_URL") ?? "",
@@ -143,6 +102,5 @@ export function loadFlowsConfig(env: Env = process.env): FlowsConfig {
     ),
     queuePingMs: duration(env, "SELFHOST_FLOWS_QUEUE_PING_MS", 20_000, 1_000, 120_000),
     storage,
-    runtimeEnvironment,
   });
 }

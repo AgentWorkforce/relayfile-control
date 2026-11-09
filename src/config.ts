@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { z } from "zod";
 
 const MiB = 1024 * 1024;
@@ -23,6 +24,37 @@ const optional = z
   .string()
   .optional()
   .transform((v) => (v && v.trim().length > 0 ? v.trim() : undefined));
+
+/**
+ * An absolute http(s) origin: scheme, host and optional port only (no
+ * credentials, path, query or fragment). Normalized to `URL.origin`.
+ */
+export function parseOrigin(value: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (url.username || url.password || url.search || url.hash || url.pathname !== "/") return null;
+  if (/[?#]$/.test(value.trim())) return null;
+  return url.origin;
+}
+
+const origin = z.string().transform((v, ctx) => {
+  const parsed = parseOrigin(v);
+  if (!parsed) {
+    ctx.addIssue({ code: "custom", message: "must be an absolute http(s) origin" });
+    return z.NEVER;
+  }
+  return parsed;
+});
+
+/** Shared secrets verified with a constant-time compare must carry at least 32 bytes. */
+const longSecret = optional.refine((v) => v === undefined || Buffer.byteLength(v, "utf8") >= 32, {
+  message: "must be at least 32 bytes",
+});
 
 /**
  * Every knob in docs/design/webhook-ingest.md, all finite, all env-driven.
@@ -102,12 +134,96 @@ export const ConfigSchema = z.object({
   RELAYCONTROL_LICENSE_PUBLIC_KEY: optional,
   ENTITLEMENT_REFRESH_SECONDS: int(300, 5, 86_400),
   ENTITLEMENT_GRACE_SECONDS: int(86_400, 0, 30 * 86_400),
+
+  // Flows API (README "Flows API").
+  /**
+   * This service's public origin. Sent as `aud` when introspecting
+   * relay-control access tokens; relay-control must list it in
+   * SELFHOST_INTROSPECT_AUDIENCES.
+   */
+  RELAYFILE_CONTROL_PUBLIC_ORIGIN: origin,
+  /**
+   * The public URL users and workers reach the Flows routes at (worker
+   * register/start commands, local-run `apiUrl`). The ingress routes the
+   * Flows paths here, so this is normally the installation's shared public
+   * URL. Defaults to RELAYFILE_CONTROL_PUBLIC_ORIGIN.
+   */
+  FLOWS_PUBLIC_BASE_URL: z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      if (v === undefined || v.trim() === "") return undefined;
+      try {
+        const url = new URL(v.trim());
+        if ((url.protocol === "http:" || url.protocol === "https:") && !url.username && !url.password && !url.search && !url.hash) {
+          return url.toString().replace(/\/+$/, "");
+        }
+      } catch {
+        // fall through
+      }
+      ctx.addIssue({ code: "custom", message: "must be an absolute http(s) URL" });
+      return z.NEVER;
+    }),
+  /** Mounts the Flows routes and starts their background workers. */
+  FLOWS_ENABLED: bool(false),
+  /** Bearer for relay-control POST /internal/v1/auth/introspect. */
+  RELAYCONTROL_INTROSPECT_SECRET: optional,
+  /** Sent as the bearer on every call to relay-control's Flows credential broker. */
+  RELAYFILE_CONTROL_BROKER_SECRET: optional,
+  /** Verified on GET /internal/v1/telemetry/flows. Unset disables the route (404). */
+  RELAYFILE_CONTROL_TELEMETRY_SECRET: longSecret,
+  /** Keyring for run envSecrets at rest (AES-256-GCM; 32 bytes as hex or base64). */
+  RELAYFILE_CONTROL_ENCRYPTION_KEY_ID: optional,
+  RELAYFILE_CONTROL_ENCRYPTION_KEY: optional,
+  RELAYFILE_CONTROL_ENCRYPTION_PREVIOUS_KEY_ID: optional,
+  RELAYFILE_CONTROL_ENCRYPTION_PREVIOUS_KEY: optional,
+  /** Introspection answers are cached per token hash for at most this long. */
+  FLOWS_INTROSPECTION_CACHE_SECONDS: int(30, 0, 30),
+  FLOWS_REVOKE_OUTBOX_INTERVAL_MS: int(5_000, 100, 3_600_000),
+}).superRefine((c, ctx) => {
+  if (!c.FLOWS_ENABLED) return;
+  const required: Array<keyof typeof c> = [
+    "RELAYCONTROL_BASE_URL",
+    "RELAYCONTROL_INTROSPECT_SECRET",
+    "RELAYFILE_CONTROL_BROKER_SECRET",
+    "RELAYFILE_CONTROL_ENCRYPTION_KEY_ID",
+    "RELAYFILE_CONTROL_ENCRYPTION_KEY",
+  ];
+  for (const key of required) {
+    if (c[key] === undefined) ctx.addIssue({ code: "custom", path: [key], message: "required when FLOWS_ENABLED" });
+  }
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
 
+/** Secrets that may also be given as a file path in `<NAME>_FILE`. */
+export const FILE_SECRETS = [
+  "RELAYCONTROL_INTROSPECT_SECRET",
+  "RELAYFILE_CONTROL_BROKER_SECRET",
+  "RELAYFILE_CONTROL_TELEMETRY_SECRET",
+  "RELAYFILE_CONTROL_ENCRYPTION_KEY",
+  "RELAYFILE_CONTROL_ENCRYPTION_PREVIOUS_KEY",
+] as const;
+
+/** Resolves `<NAME>_FILE` into `<NAME>`; setting both is a configuration error. */
+export function resolveFileSecrets(env: NodeJS.ProcessEnv, read: (path: string) => string = (path) => readFileSync(path, "utf8")): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...env };
+  const conflicts: string[] = [];
+  for (const name of FILE_SECRETS) {
+    const file = env[`${name}_FILE`]?.trim();
+    if (!file) continue;
+    if (env[name]?.trim()) {
+      conflicts.push(name);
+      continue;
+    }
+    out[name] = read(file).trim();
+  }
+  if (conflicts.length) throw new Error(`invalid configuration: ${conflicts.join(", ")} (set the value or _FILE, not both)`);
+  return out;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  const parsed = ConfigSchema.safeParse(env);
+  const parsed = ConfigSchema.safeParse(resolveFileSecrets(env));
   if (!parsed.success) {
     const fields = parsed.error.issues.map((i) => i.path.join(".")).join(", ");
     throw new Error(`invalid configuration: ${fields}`);
@@ -117,7 +233,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
 /** Test/dev helper: defaults plus overrides, without reading process.env. */
 export function testConfig(overrides: Partial<Record<keyof Config, string>> = {}): Config {
-  return ConfigSchema.parse(overrides);
+  return ConfigSchema.parse({ RELAYFILE_CONTROL_PUBLIC_ORIGIN: "http://relayfile-control.test", ...overrides });
 }
 
 const SECRET_KEYS = new Set<keyof Config>([
@@ -132,6 +248,11 @@ const SECRET_KEYS = new Set<keyof Config>([
   "RELAYCONTROL_SERVICE_TOKEN",
   "RELAYCONTROL_LICENSE_DOC",
   "DATABASE_URL",
+  "RELAYCONTROL_INTROSPECT_SECRET",
+  "RELAYFILE_CONTROL_BROKER_SECRET",
+  "RELAYFILE_CONTROL_TELEMETRY_SECRET",
+  "RELAYFILE_CONTROL_ENCRYPTION_KEY",
+  "RELAYFILE_CONTROL_ENCRYPTION_PREVIOUS_KEY",
 ]);
 
 /** Config safe to log: secrets reduced to "set"/"unset". */
