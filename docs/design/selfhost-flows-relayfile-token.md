@@ -55,6 +55,7 @@ POST /internal/v1/flows/credentials/relayfile
   200 { relayfileToken, relayfileTokenExpiresAt, relayfileMountPaths, scopes, aud, credentialId }
   400 invalid_request | invalid_mount_paths
   404 relayfile_not_configured          (issuer has no Relayfile URL or no introspection secret)
+  404 workspace_not_found
   409 relayfile_audience_not_accepted   (Relayfile origin not an accepted introspection audience)
 POST /internal/v1/flows/credentials/revoke { runId }
   existing route; now also revokes the run's Relayfile credential; idempotent
@@ -129,8 +130,14 @@ keyring, like `env_secrets_ciphertext`:
 ALTER TABLE selfhost_workflow_runs
   ADD COLUMN relayfile_credential_ciphertext text,     -- the 200 body, encrypted
   ADD COLUMN relayfile_credential_id         text,
-  ADD COLUMN relayfile_credential_expires_at timestamptz;
+  ADD COLUMN relayfile_credential_expires_at timestamptz,
+  ADD COLUMN relayfile_credential_refusal    jsonb;   -- { code, reason? } once refused
 ```
+
+The fourth column, `relayfile_credential_refusal`, stores the "no
+credential" decision (§2.5) so redelivery reuses it instead of calling the
+issuer again or appending a second event; it is set at most once and only
+while the ciphertext is empty.
 
 - First call with the column empty: compute mount paths (§2.2), call the
   issuer, verify (§2.4), store, place the three fields in the payload.
@@ -140,7 +147,7 @@ ALTER TABLE selfhost_workflow_runs
 - `finishRun` already enqueues `enqueueCredentialRevocation(tx, runId)`
   (`src/flows/revoke-outbox.ts`); the same outbox row now also revokes the
   Relayfile credential because relay-control's `revoke { runId }` covers
-  both. The ciphertext columns are nulled in the same transaction. No new
+  both. All four credential columns are nulled in the same transaction. No new
   outbox, no new config.
 
 ### 2.4 Verification before dispatch
@@ -164,7 +171,9 @@ must satisfy every row:
 
 Raw tokens are never logged or cached beyond the existing sha256 cache key.
 A credential that fails verification is treated as unavailable (§2.5) and
-revoked at once through a normal outbox row.
+revoked with the run at its end. It is not revoked early: the shared
+`revoke { runId }` would also end the run's CLI-credential references, and
+the failed credential never left this process and is not stored.
 
 ### 2.5 "Refuse clearly"
 
@@ -175,9 +184,9 @@ the token appears in either.
 | Situation | Code in the run event | Operator log event |
 |-----------|----------------------|--------------------|
 | Relayfile not configured here (`SELFHOST_FLOWS_WORKER_RELAYFILE_URL` empty) | `relayfile_not_configured` | none (expected state for installs without the add-on) |
-| Issuer 404 `relayfile_not_configured`, 409 `relayfile_audience_not_accepted`, 400 `invalid_mount_paths`, unknown 4xx | the issuer's code (`unknown_refusal:<status>` for unknown) | `flows_relayfile_credential_refused { workspaceId, runId, status, code }` |
+| Issuer 404 `relayfile_not_configured`, 404 `workspace_not_found`, 409 `relayfile_audience_not_accepted`, 400 `invalid_mount_paths`, 400 `invalid_request`, unknown 4xx | the issuer's code (`unknown_refusal:<status>` for unknown) | `flows_relayfile_credential_refused { workspaceId, runId, status, code }` |
 | Unmountable provider (§2.2) | `invalid_mount_paths` with `reason` | same, with `reason` |
-| Verification failed (§2.4) | `relayfile_credential_invalid` with `reason` | same, with `reason`, plus the outbox revocation |
+| Verification failed (§2.4) | `relayfile_credential_invalid` with `reason` | same, with `reason` |
 | Issuer or introspection transport failure / 5xx | not a refusal | existing exponential outage hold in `claimNext` (`store.ts:1275-1285`): claim released, run retried |
 
 Run event: `run.relayfile_credential_unavailable { code, reason? }`,
