@@ -51,8 +51,8 @@ Issue route, behind the existing `RELAYFILE_CONTROL_BROKER_SECRET` bearer:
 
 ```
 POST /internal/v1/flows/credentials/relayfile
-  { workspaceId, runId, mountPaths: string[], readOnly?: boolean }
-  200 { relayfileToken, relayfileTokenExpiresAt, relayfileMountPaths, scopes, aud }
+  { workspaceId, runId, mountPaths: string[], readOnly?: boolean, aud?: string }
+  200 { relayfileToken, relayfileTokenExpiresAt, relayfileMountPaths, scopes, aud, credentialId }
   400 invalid_request | invalid_mount_paths
   404 relayfile_not_configured          (issuer has no Relayfile URL or no introspection secret)
   409 relayfile_audience_not_accepted   (Relayfile origin not an accepted introspection audience)
@@ -65,16 +65,22 @@ normalized, no `.`/`..`, no trailing slash, no `*`, at most 512 chars; the
 first path must be `/workflows/runs/<runId>` for this run (or
 `/workflows/schedules/<id>`).
 
-Asks from this side, to settle before the relay-control PR goes READY:
+Agreed additions (layered-control, relay message 245583069449891840,
+2026-11-09):
 
-- **A1** Add `credentialId` to the 200 body. relayfile-control verifies
-  `token_id === credentialId` (§2.4) and logs the id, never the token.
-- **A2** Accept an optional `aud` in the request body and answer 409
-  `relayfile_audience_not_accepted` when it differs from the issuer's own
-  origin. Both services carry `SELFHOST_FLOWS_WORKER_RELAYFILE_URL`; a drift
-  between the two configs should fail at issue time, not at the worker.
-- **A3** Confirm that `revoke { runId }` for a run with no Relayfile
-  credential stays a 2xx (it must; relayfile-control calls it for every run).
+- **A1** The 200 body carries `credentialId` (uuid), equal to the
+  introspection `token_id`/`sub`. relayfile-control logs the id, never the
+  token.
+- **A2** The request accepts an optional `aud`; when its normalized origin
+  differs from the issuer's own Relayfile origin the answer is 409
+  `relayfile_audience_not_accepted` (same code as the not-an-accepted-audience
+  case; the message says which). relayfile-control always sends it.
+- **A3** `revoke { runId }` answers 200 `{ revoked: true }` for a run with no
+  Relayfile credential; it never 404s. relayfile-control calls it for every
+  run through the existing outbox.
+
+Only an explicit second `relayfile` call for the same `runId` rotates the
+credential; relayfile-control never makes one for a live run (§2.3).
 
 ## 2. relayfile-control side (this repository)
 
