@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { BrokerError, BrokerUnavailable, httpRelaycastCredentialSource } from "../src/flows/broker.ts";
+import { claimFailure } from "../src/flows/introspection.ts";
 import { MemoryLogger } from "../src/observability/log.ts";
 import { AUDIENCE, openQueue, seedTenant, startControlPlane } from "./support/flows.ts";
 
@@ -327,4 +328,143 @@ test("store errors are logged by name only", async (t) => {
   assert.ok(event);
   assert.equal(event.error, "Error");
   assert.doesNotMatch(JSON.stringify(logger.events), /rk_live_primary/);
+});
+
+test("a relay-control outage during assignment holds the workspace with a growing delay", async (t) => {
+  const cp = await startControlPlane();
+  t.after(() => cp.stop());
+  const tenant = await seedTenant(cp);
+  const store = cp.flows;
+  store.outageHoldInitialMs = 1_000;
+  store.outageHoldMaxMs = 3_000;
+  const first = await registerWorker(cp, tenant.ownerToken, "w1");
+  const second = await registerWorker(cp, tenant.ownerToken, "w2");
+  const run = await cp.api("/api/v1/workflows/run", { method: "POST", token: tenant.memberToken, body: { workflow: FLOW, fileType: "yaml" } });
+  assert.equal(run.status, 201);
+  const real = store.relaycastCredentials!;
+  let failures = 3;
+  let calls = 0;
+  store.relaycastCredentials = async (workspaceId) => {
+    calls += 1;
+    if (failures > 0) {
+      failures -= 1;
+      throw new BrokerUnavailable("relay-control answered 503");
+    }
+    return real(workspaceId);
+  };
+  let clock = Date.now();
+  t.mock.method(Date, "now", () => clock);
+  const claim = (workerId: string) => store.claimNext({ id: workerId, workspaceId: tenant.workspaceId, tags: [] });
+  const assignmentStatus = async () =>
+    (await cp.api(`/api/v1/workflows/runs/${run.body.runId}`, { token: tenant.memberToken })).body.assignmentStatus;
+
+  // Hold after each failure: 1 s, then 2 s, then 3 s (doubled to 4 s, capped).
+  for (const [attempt, holdMs] of [[1, 1_000], [2, 2_000], [3, 3_000]] as const) {
+    await assert.rejects(claim(first.workerId), { name: "BrokerUnavailable" });
+    assert.equal(calls, attempt);
+    assert.equal(await assignmentStatus(), "queued", "the claim was released");
+    for (const workerId of [first.workerId, second.workerId]) assert.equal(await claim(workerId), null, "held for every worker");
+    clock += holdMs - 1;
+    assert.equal(await claim(second.workerId), null, `still held just before ${holdMs} ms`);
+    assert.equal(calls, attempt, "no attempt while held");
+    clock += 1;
+  }
+  // The hold expired and relay-control answers again: the run is assigned.
+  const assignment = await claim(first.workerId);
+  assert.equal(assignment?.runId, run.body.runId);
+  assert.equal(calls, 4);
+  const events = await cp.api(`/api/v1/workflows/runs/${run.body.runId}/events`, { token: tenant.memberToken });
+  assert.deepEqual(
+    events.body.events.map((event: { eventType: string }) => event.eventType),
+    ["run.queued", "run.assigned"],
+    "run.assigned is written once, for the delivered attempt only",
+  );
+
+  // Success reset the delay: the next outage holds for the initial 1 s again.
+  const next = await cp.api("/api/v1/workflows/run", { method: "POST", token: tenant.memberToken, body: { workflow: FLOW, fileType: "yaml" } });
+  failures = 1;
+  await assert.rejects(claim(second.workerId), { name: "BrokerUnavailable" });
+  clock += 999;
+  assert.equal(await claim(second.workerId), null);
+  clock += 1;
+  assert.equal((await claim(second.workerId))?.runId, next.body.runId);
+});
+
+test("an outage hold is cleared by workspace delete", async (t) => {
+  const cp = await startControlPlane({}, { RELAYFILE_CONTROL_BROKER_SECRET: BROKER_SECRET });
+  t.after(() => cp.stop());
+  const tenant = await seedTenant(cp);
+  const store = cp.flows;
+  const worker = await registerWorker(cp, tenant.ownerToken);
+  await cp.api("/api/v1/workflows/run", { method: "POST", token: tenant.memberToken, body: { workflow: FLOW, fileType: "yaml" } });
+  const real = store.relaycastCredentials!;
+  store.relaycastCredentials = async () => {
+    throw new BrokerUnavailable("relay-control answered 503");
+  };
+  await assert.rejects(store.claimNext({ id: worker.workerId, workspaceId: tenant.workspaceId, tags: [] }), { name: "BrokerUnavailable" });
+  assert.equal((await cp.api(`/internal/v1/flows/workspaces/${tenant.workspaceId}`, { method: "DELETE", token: BROKER_SECRET })).status, 200);
+  // The workspace starts over: a fresh worker and run are offered at once.
+  store.relaycastCredentials = real;
+  const fresh = await registerWorker(cp, tenant.ownerToken, "w-fresh");
+  const run = await cp.api("/api/v1/workflows/run", { method: "POST", token: tenant.memberToken, body: { workflow: FLOW, fileType: "yaml" } });
+  assert.equal((await store.claimNext({ id: fresh.workerId, workspaceId: tenant.workspaceId, tags: [] }))?.runId, run.body.runId);
+});
+
+test("workspace delete queues revocations for exactly the deleted runs and stays idempotent", async (t) => {
+  const cp = await startControlPlane();
+  t.after(() => cp.stop());
+  const tenant = await seedTenant(cp);
+  const runs: string[] = [];
+  for (let i = 0; i < 3; i += 1) {
+    const run = await cp.api("/api/v1/workflows/run", { method: "POST", token: tenant.memberToken, body: { workflow: FLOW, fileType: "yaml" } });
+    assert.equal(run.status, 201);
+    runs.push(run.body.runId);
+  }
+  // A finished run already has its revocation queued; it is not queued twice.
+  await cp.database.query("INSERT INTO selfhost_cli_credential_revocations (run_id) VALUES ($1)", [runs[0]]);
+  const deleted = await cp.flows.deleteWorkspace(tenant.workspaceId);
+  assert.deepEqual(deleted, { flows: 0, runs: 3, workers: 0, enrollmentTokens: 0, revocationsQueued: 2 });
+  const queued = await cp.database.query<{ run_id: string }>("SELECT run_id FROM selfhost_cli_credential_revocations ORDER BY run_id");
+  assert.deepEqual(queued.rows.map((r) => r.run_id), [...runs].sort());
+  assert.deepEqual(await cp.flows.deleteWorkspace(tenant.workspaceId), {
+    flows: 0,
+    runs: 0,
+    workers: 0,
+    enrollmentTokens: 0,
+    revocationsQueued: 0,
+  });
+  assert.equal((await cp.database.query("SELECT run_id FROM selfhost_cli_credential_revocations")).rows.length, 3);
+});
+
+test("introspection aud is compared as a normalized origin and fails closed", () => {
+  const now = Date.now();
+  const answer = {
+    active: true as const,
+    sub: "u1",
+    email: "u1@acme.test",
+    principal_type: "desktop-user",
+    org: "o1",
+    workspace: "w1",
+    scopes: [],
+    exp: Math.floor(now / 1000) + 600,
+    token_id: "t1",
+  };
+  const audience = "https://flows.example.com";
+  for (const aud of ["https://Flows.Example.com:443/", "https://flows.example.com/", "https://flows.example.com"]) {
+    assert.equal(claimFailure({ ...answer, aud }, audience, now), null, aud);
+  }
+  for (const aud of [
+    undefined,
+    "",
+    "not a url",
+    "http://flows.example.com",
+    "https://flows.example.com:8443",
+    "https://flows.example.com/path",
+    "https://flows.example.com/?q=1",
+    "https://user@flows.example.com",
+    "https://other.example.com",
+  ]) {
+    const { aud: _drop, ...rest } = { ...answer, aud };
+    assert.equal(claimFailure(aud === undefined ? rest : { ...rest, aud }, audience, now), "audience", String(aud));
+  }
 });

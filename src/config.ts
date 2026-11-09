@@ -42,6 +42,16 @@ export function parseOrigin(value: string): string | null {
   return url.origin;
 }
 
+/** True for an absolute http(s) URL (a path, query or trailing slash is allowed). */
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 /** An optional http(s) origin (see parseOrigin); blank means unset. */
 const optionalOrigin = z
   .string()
@@ -132,8 +142,12 @@ export const ConfigSchema = z.object({
   RELAYFILE_CONTROL_ADMIN_TOKEN: secrets,
 
   // §11 entitlement.
-  /** relay-control's origin (entitlement, introspection and the Flows credential broker). */
-  RELAYCONTROL_BASE_URL: optionalOrigin,
+  /**
+   * relay-control's URL (entitlement, introspection and the Flows credential
+   * broker). An absolute http(s) URL; with FLOWS_ENABLED it must be a bare
+   * origin (see parseOrigin) and is normalized to it. Checked in superRefine.
+   */
+  RELAYCONTROL_BASE_URL: optional,
   RELAYCONTROL_SERVICE_TOKEN: optional,
   RELAYCONTROL_LICENSE_DOC: optional,
   RELAYCONTROL_LICENSE_FILE: optional,
@@ -207,6 +221,18 @@ export const ConfigSchema = z.object({
     const twin = distinct.slice(0, index).find((other) => c[other] === value);
     if (twin) ctx.addIssue({ code: "custom", path: [key], message: `must differ from ${twin}` });
   });
+  // Flows join route paths onto RELAYCONTROL_BASE_URL, so they need a bare
+  // origin. Without Flows only the entitlement client uses it, and a path
+  // there was always tolerated.
+  if (c.RELAYCONTROL_BASE_URL !== undefined) {
+    if (c.FLOWS_ENABLED) {
+      if (!parseOrigin(c.RELAYCONTROL_BASE_URL)) {
+        ctx.addIssue({ code: "custom", path: ["RELAYCONTROL_BASE_URL"], message: "must be an absolute http(s) origin when FLOWS_ENABLED" });
+      }
+    } else if (!isHttpUrl(c.RELAYCONTROL_BASE_URL)) {
+      ctx.addIssue({ code: "custom", path: ["RELAYCONTROL_BASE_URL"], message: "must be an absolute http(s) URL" });
+    }
+  }
   if (!c.FLOWS_ENABLED) return;
   const required: Array<keyof typeof c> = [
     "RELAYFILE_CONTROL_PUBLIC_ORIGIN",
@@ -219,7 +245,11 @@ export const ConfigSchema = z.object({
   for (const key of required) {
     if (c[key] === undefined) ctx.addIssue({ code: "custom", path: [key], message: "required when FLOWS_ENABLED" });
   }
-});
+}).transform((c) =>
+  c.FLOWS_ENABLED && c.RELAYCONTROL_BASE_URL !== undefined
+    ? { ...c, RELAYCONTROL_BASE_URL: parseOrigin(c.RELAYCONTROL_BASE_URL) ?? c.RELAYCONTROL_BASE_URL }
+    : c,
+);
 
 export type Config = z.infer<typeof ConfigSchema>;
 

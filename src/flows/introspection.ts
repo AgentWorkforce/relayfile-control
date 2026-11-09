@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { IncomingMessage } from "node:http";
+import { parseOrigin } from "../config.ts";
 import { joinUrl } from "./http.ts";
 import type { FlowsUserAccess, Principal } from "./routes.ts";
 
@@ -13,9 +14,10 @@ import type { FlowsUserAccess, Principal } from "./routes.ts";
  * authenticated request: `{active:false, reason}` or an active answer.
  *
  * relay-control's answer is not trusted blindly: an active answer whose
- * `aud` is not this service's audience, whose `exp` has passed, or whose
- * `iat` lies more than 60 s in the future is treated as inactive (reason
- * `audience`, `expired` or `issued_in_future`).
+ * `aud` is not this service's audience (compared as normalized origins),
+ * whose `exp` has passed, or whose `iat` lies more than 60 s in the future
+ * is treated as inactive (reason `audience`, `expired` or
+ * `issued_in_future`).
  *
  * Answers are cached for at most `cacheSeconds` (never past the token's
  * `exp`), keyed by sha256 of the token, the audience and the workspace. Raw
@@ -89,7 +91,10 @@ function parseAnswer(body: unknown): Introspection {
 
 /** Local claim checks on an active answer; returns the inactive reason or null. */
 export function claimFailure(answer: ActiveIntrospection, audience: string, nowMs: number): string | null {
-  if (answer.aud !== audience) return "audience";
+  // Origins compare after normalization (lowercase host, default port and
+  // trailing slash dropped). An `aud` that is not an origin fails closed.
+  const answered = answer.aud === undefined ? null : parseOrigin(answer.aud);
+  if (answered === null || answered !== (parseOrigin(audience) ?? audience)) return "audience";
   if (answer.exp * 1000 <= nowMs) return "expired";
   if (answer.iat !== undefined && answer.iat * 1000 > nowMs + IAT_SKEW_SECONDS * 1000) return "issued_in_future";
   return null;

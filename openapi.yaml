@@ -1077,8 +1077,9 @@ paths:
       summary: Verify a worker credential for relay-control's runtime-environment route
       description: |
         Authenticated by RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET (constant-time
-        compare). 404 when the secret is not configured. The credential is
-        never echoed or logged.
+        compare). 404 when the secret is not configured or Flows are off
+        (FLOWS_ENABLED unset); the caller treats a 404 as nothing to do. The
+        credential is never echoed or logged.
       security: [{ runtimeVerifySecret: [] }]
       requestBody:
         required: true
@@ -1104,7 +1105,7 @@ paths:
                   scopes: { type: array, items: { type: string } }
         "400": { description: "invalid_request (missing token or malformed body)" }
         "401": { description: "unauthorized (missing or wrong secret)" }
-        "404": { description: "not_found (RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET unset)" }
+        "404": { description: "not_found (RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET unset, or FLOWS_ENABLED off); the caller treats it as nothing to do" }
         "405": { description: "method_not_allowed" }
   /internal/v1/flows/workspaces/{workspaceId}:
     delete:
@@ -1112,10 +1113,12 @@ paths:
       description: |
         Called by relay-control when it deletes a workspace. Authenticated by
         RELAYFILE_CONTROL_BROKER_SECRET (constant-time compare); 404 when it
-        is not configured. Deletes flows, runs (with secrets, events, steps,
+        is not configured or Flows are off (FLOWS_ENABLED unset), which the
+        caller treats as nothing to do. Deletes flows, runs (with secrets, events, steps,
         assignments and stored objects), workers and enrollment tokens, and
         queues CLI-credential revocations for the runs, in one transaction.
-        Idempotent: a repeat answers 200 with zero counts.
+        Idempotent: a repeat answers 200 with zero counts. With GCS storage
+        the bucket objects are left behind.
       security: [{ brokerSecret: [] }]
       parameters:
         - { name: workspaceId, in: path, required: true, schema: { type: string, format: uuid } }
@@ -1140,7 +1143,7 @@ paths:
                       revocationsQueued: { type: integer }
         "400": { description: "invalid_request (workspace id is not a UUID)" }
         "401": { description: "unauthorized (missing or wrong secret)" }
-        "404": { description: "not_found (RELAYFILE_CONTROL_BROKER_SECRET unset)" }
+        "404": { description: "not_found (RELAYFILE_CONTROL_BROKER_SECRET unset, or FLOWS_ENABLED off); the caller treats it as nothing to do" }
         "405": { description: "method_not_allowed" }
 components:
   securitySchemes:

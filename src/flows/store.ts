@@ -229,7 +229,18 @@ export class FlowsStore {
    * claim is released and the workspace is not retried in a tight loop.
    */
   relaycastRefusalHoldMs = 60_000;
-  readonly #relaycastRefusedUntil = new Map<string, number>();
+  /**
+   * First hold after relay-control failed during assignment (5xx, network,
+   * timeout or a malformed answer from the binding or credential calls).
+   * Each further consecutive failure doubles it, up to `outageHoldMaxMs`; a
+   * successful assignment in the workspace resets it.
+   */
+  outageHoldInitialMs = 5_000;
+  outageHoldMaxMs = 300_000;
+  /** Workspace id -> time (ms) before which its queue is not offered. */
+  readonly #workspaceHeldUntil = new Map<string, number>();
+  /** Workspace id -> the hold applied after its last consecutive outage. */
+  readonly #outageHoldMs = new Map<string, number>();
   readonly #listeners = new Set<() => void>();
 
   constructor(
@@ -1209,10 +1220,10 @@ export class FlowsStore {
    * assignment at a time, matching the serial CLI loop.
    */
   async claimNext(worker: { id: string; workspaceId: string; tags: string[] }): Promise<WorkAssignmentRecord | null> {
-    const heldUntil = this.#relaycastRefusedUntil.get(worker.workspaceId);
+    const heldUntil = this.#workspaceHeldUntil.get(worker.workspaceId);
     if (heldUntil !== undefined) {
       if (heldUntil > Date.now()) return null;
-      this.#relaycastRefusedUntil.delete(worker.workspaceId);
+      this.#workspaceHeldUntil.delete(worker.workspaceId);
     }
     const claimed = await this.database.transaction(async (tx) => {
       const busy = await tx.query(
@@ -1243,16 +1254,16 @@ export class FlowsStore {
           RETURNING a.*, r.requested_worker_id`,
         [id, worker.id],
       );
-      const row = updated.rows[0];
-      if (!row) return null;
-      await this.appendEventTx(tx, String(row.run_id), "run.assigned", null, {
-        workerId: worker.id,
-      });
-      return row;
+      return updated.rows[0] ?? null;
     });
     if (!claimed) return null;
     try {
-      return this.assignmentFromRow(claimed, await this.workflowPayload(String(claimed.run_id)));
+      const assignment = this.assignmentFromRow(claimed, await this.workflowPayload(String(claimed.run_id)));
+      // Only a delivered assignment is recorded, so failed attempts do not
+      // pile up `run.assigned` events.
+      await this.appendEvent(String(claimed.run_id), { eventType: "run.assigned", payload: { workerId: worker.id } });
+      this.#outageHoldMs.delete(worker.workspaceId);
+      return assignment;
     } catch (error) {
       // Release the claim so the run is retried rather than stranded.
       await this.database.query(
@@ -1261,10 +1272,21 @@ export class FlowsStore {
           WHERE id = $1 AND status = 'assigned' AND acked_at IS NULL`,
         [claimed.id, claimed.requested_worker_id ?? null],
       );
+      if (!(error instanceof RelaycastBindingRefused) && !(error instanceof FlowsError)) {
+        // relay-control (or the database) failed: hold the workspace with a
+        // growing delay instead of re-claiming on every poll of every worker.
+        // Time-based, so the queue always resumes.
+        const previous = this.#outageHoldMs.get(worker.workspaceId);
+        const holdMs = previous === undefined
+          ? this.outageHoldInitialMs
+          : Math.min(this.outageHoldMaxMs, previous * 2);
+        this.#outageHoldMs.set(worker.workspaceId, holdMs);
+        this.#workspaceHeldUntil.set(worker.workspaceId, Date.now() + holdMs);
+      }
       if (error instanceof RelaycastBindingRefused) {
         // A configuration error, not an outage: one event, then the
-        // workspace's queue waits instead of re-claiming every poll.
-        this.#relaycastRefusedUntil.set(worker.workspaceId, Date.now() + this.relaycastRefusalHoldMs);
+        // workspace's queue waits a fixed time instead of re-claiming every poll.
+        this.#workspaceHeldUntil.set(worker.workspaceId, Date.now() + this.relaycastRefusalHoldMs);
         this.logger?.event("flows_relaycast_binding_refused", {
           area: "flows",
           workspaceId: worker.workspaceId,
@@ -1318,14 +1340,21 @@ export class FlowsStore {
   }> {
     if (!isUuid(workspaceId)) throw new FlowsError(400, "invalid_request", "workspace id must be a UUID");
     const counts = await this.database.transaction(async (tx) => {
-      const revocations = await tx.query(
-        `INSERT INTO selfhost_cli_credential_revocations (run_id)
-         SELECT id FROM selfhost_workflow_runs WHERE workspace_id = $1
-         ON CONFLICT (run_id) DO NOTHING
-         RETURNING run_id`,
+      // Revocations are queued for exactly the runs this statement deleted, so
+      // a run committed concurrently cannot be deleted without one.
+      const runs = await tx.query<{ id: string }>(
+        "DELETE FROM selfhost_workflow_runs WHERE workspace_id = $1 RETURNING id",
         [workspaceId],
       );
-      const runs = await tx.query("DELETE FROM selfhost_workflow_runs WHERE workspace_id = $1 RETURNING id", [workspaceId]);
+      const revocations = runs.rows.length
+        ? await tx.query(
+          `INSERT INTO selfhost_cli_credential_revocations (run_id)
+           SELECT unnest($1::uuid[])
+           ON CONFLICT (run_id) DO NOTHING
+           RETURNING run_id`,
+          [runs.rows.map((row) => row.id)],
+        )
+        : { rows: [] };
       // Assignments cascade with their runs; this catches any left without one.
       await tx.query("DELETE FROM selfhost_work_assignments WHERE workspace_id = $1", [workspaceId]);
       const flows = await tx.query("DELETE FROM selfhost_flow_definitions WHERE workspace_id = $1 RETURNING id", [workspaceId]);
@@ -1342,7 +1371,8 @@ export class FlowsStore {
         revocationsQueued: revocations.rows.length,
       };
     });
-    this.#relaycastRefusedUntil.delete(workspaceId);
+    this.#workspaceHeldUntil.delete(workspaceId);
+    this.#outageHoldMs.delete(workspaceId);
     // Open queue streams of the deleted workers see them gone and end.
     this.notifyWork();
     return counts;

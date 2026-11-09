@@ -76,7 +76,7 @@ required:
 | Variable | Purpose |
 |---|---|
 | `RELAYFILE_CONTROL_PUBLIC_ORIGIN` | audience (`aud`) sent with every introspection request and checked on every answer |
-| `RELAYCONTROL_BASE_URL` | relay-control's origin (no path, query or credentials), for introspection and the credential broker |
+| `RELAYCONTROL_BASE_URL` | relay-control's origin (no path, query or credentials), for introspection and the credential broker. With Flows off it only needs to be an absolute http(s) URL, as before |
 | `RELAYCONTROL_INTROSPECT_SECRET` | at least 32 bytes; bearer for relay-control's introspection endpoint |
 | `RELAYFILE_CONTROL_BROKER_SECRET` | at least 32 bytes; sent as `Authorization: Bearer` on every credential-broker call to relay-control, and accepted on `DELETE /internal/v1/flows/workspaces/{id}` |
 | `RELAYFILE_CONTROL_ENCRYPTION_KEY_ID`, `RELAYFILE_CONTROL_ENCRYPTION_KEY` | key for run secrets and worker tokens at rest (32 bytes, hex or base64); `_PREVIOUS_KEY_ID` / `_PREVIOUS_KEY` keep the old key readable during rotation |
@@ -97,7 +97,8 @@ Optional:
 Every secret above can also be given as a file path in `<NAME>_FILE`.
 Setting both the value and `_FILE` is a configuration error. The
 introspection, broker, telemetry and runtime-verify secrets must all differ;
-startup refuses two equal values.
+startup refuses two equal values. The 32-byte minimum and the distinctness
+check apply only to the secrets that are set.
 
 ### Seams
 
@@ -163,8 +164,36 @@ startup refuses two equal values.
   enrollment tokens, and queues CLI-credential revocations for its runs, in
   one transaction. It is idempotent: a repeat answers 200 with zero counts.
   With GCS storage the bucket objects are not removed.
+- **404 on the internal routes.** The runtime-verify and workspace delete
+  routes answer 404 both when their secret is unset and when Flows are off
+  (`FLOWS_ENABLED` unset). relay-control should treat that 404 as nothing
+  to do: this installation holds no Flows data to verify or delete.
 
-### Migration
+### Assignment holds
+
+If relay-control refuses a workspace's Relaycast binding (4xx), the
+workspace's queue is held for a fixed 60 s. If relay-control fails during
+assignment (5xx, network error, timeout or a malformed answer from the
+binding or credential calls), the claim is released and the workspace's
+queue is held for 5 s, doubling on each further consecutive failure up to
+5 min, and reset by the next successful assignment. Holds are per process
+and time-based, and a workspace delete clears them. `run.assigned` is
+recorded only once an assignment has been delivered.
+
+### Known gaps
+
+- **Runtime environment is not wired.** Nothing resolves a workspace's
+  runtime environment (env vars and integration tokens) yet, so runs carry
+  only their own `envSecrets`. relay-control's environment route is
+  authenticated with a secret this service does not hold; it needs to accept
+  the broker secret or expose a Flows-specific route first.
+  `src/flows/runtime-env.ts` holds the client and merge rules for then.
+- **GCS objects survive workspace delete.** With
+  `SELFHOST_FLOWS_STORAGE=gcs`, deleting a workspace removes the database
+  rows but leaves the bucket objects behind (the storage backend has no
+  delete).
+- **Pending-handoff tokens are not handled.**
+
 
 `migrations/0002_flows.sql` creates the Flows tables and the revocation
 outbox. The user, workspace, organization and credential-reference columns

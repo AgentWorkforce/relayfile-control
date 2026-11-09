@@ -22,6 +22,14 @@ workflows:
 `;
 
 test("RELAYFILE_CONTROL_PUBLIC_ORIGIN and RELAYCONTROL_BASE_URL must be absolute http(s) origins", () => {
+  const flowsOn = {
+    FLOWS_ENABLED: "true",
+    RELAYFILE_CONTROL_PUBLIC_ORIGIN: "https://files.example.com",
+    RELAYCONTROL_INTROSPECT_SECRET: "i".repeat(32),
+    RELAYFILE_CONTROL_BROKER_SECRET: "b".repeat(32),
+    RELAYFILE_CONTROL_ENCRYPTION_KEY_ID: "k1",
+    RELAYFILE_CONTROL_ENCRYPTION_KEY: "07".repeat(32),
+  };
   // Webhook-only deployments start without either.
   assert.equal(loadConfig({}).RELAYFILE_CONTROL_PUBLIC_ORIGIN, undefined);
   assert.equal(loadConfig({ RELAYFILE_CONTROL_PUBLIC_ORIGIN: "  " }).RELAYFILE_CONTROL_PUBLIC_ORIGIN, undefined);
@@ -35,9 +43,19 @@ test("RELAYFILE_CONTROL_PUBLIC_ORIGIN and RELAYCONTROL_BASE_URL must be absolute
     "/relative",
   ]) {
     assert.throws(() => loadConfig({ RELAYFILE_CONTROL_PUBLIC_ORIGIN: bad }), /RELAYFILE_CONTROL_PUBLIC_ORIGIN/, bad);
+    assert.throws(() => loadConfig({ ...flowsOn, RELAYCONTROL_BASE_URL: bad }), /invalid configuration: RELAYCONTROL_BASE_URL$/, bad);
+  }
+  // With Flows off, RELAYCONTROL_BASE_URL only feeds the entitlement client:
+  // any absolute http(s) URL, a path included, is accepted as before.
+  for (const bad of ["relay-control.example", "ftp://relay-control.example", "/relative"]) {
     assert.throws(() => loadConfig({ RELAYCONTROL_BASE_URL: bad }), /RELAYCONTROL_BASE_URL/, bad);
   }
-  assert.equal(loadConfig({ RELAYCONTROL_BASE_URL: "http://Relay-Control.internal:8080/" }).RELAYCONTROL_BASE_URL, "http://relay-control.internal:8080");
+  assert.equal(loadConfig({ RELAYCONTROL_BASE_URL: "https://relay-control.example/base/" }).RELAYCONTROL_BASE_URL, "https://relay-control.example/base/");
+  assert.equal(loadConfig({ RELAYCONTROL_BASE_URL: "http://Relay-Control.internal:8080/" }).RELAYCONTROL_BASE_URL, "http://Relay-Control.internal:8080/");
+  assert.equal(
+    loadConfig({ ...flowsOn, RELAYCONTROL_BASE_URL: "http://Relay-Control.internal:8080/" }).RELAYCONTROL_BASE_URL,
+    "http://relay-control.internal:8080",
+  );
   assert.equal(loadConfig({ RELAYFILE_CONTROL_PUBLIC_ORIGIN: "https://Files.Example.com:443/" }).RELAYFILE_CONTROL_PUBLIC_ORIGIN, "https://files.example.com");
   assert.equal(loadConfig({ RELAYFILE_CONTROL_PUBLIC_ORIGIN: "http://localhost:8080" }).RELAYFILE_CONTROL_PUBLIC_ORIGIN, "http://localhost:8080");
 });

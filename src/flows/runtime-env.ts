@@ -4,10 +4,15 @@
  *   GET /internal/v1/workspaces/{id}/environment?includeIntegrations=1
  * authenticated with SELFHOST_INTERNAL_TOKEN.
  *
- * The stock `agent-relay cloud worker` cannot call this itself, so the control
- * plane resolves it just in time when it builds an assignment payload for the
- * authenticated worker that claimed the run. Values are never persisted and
- * never written to run events or logs.
+ * Documented gap: nothing resolves the runtime environment yet.
+ * `FlowsConfig.runtimeEnvironment` is left unset, because that relay-control
+ * route is authenticated with a secret this service does not hold, so runs
+ * carry only their own envSecrets (README "Known gaps"). Once relay-control
+ * offers a route this service may call, `httpRuntimeEnvironmentSource` is
+ * the client: the store would then resolve the environment just in time
+ * when it builds an assignment payload for the authenticated worker that
+ * claimed the run. Values are never persisted and never written to run
+ * events or logs.
  */
 export type RuntimeEnvironment = {
   env: Record<string, string>;
