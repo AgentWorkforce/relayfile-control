@@ -8,7 +8,7 @@ import { describe, it } from "node:test";
 import { Consumer } from "../src/consumer/consumer.ts";
 import type { EnvelopeHandler } from "../src/consumer/envelope-handler.ts";
 import type { Db } from "../src/db/db.ts";
-import { migrate } from "../src/db/migrate.ts";
+import { listMigrations, migrate } from "../src/db/migrate.ts";
 import { StaticEntitlement } from "../src/entitlement/entitlement.ts";
 import { MemoryLogger } from "../src/observability/log.ts";
 import { Metrics } from "../src/observability/metrics.ts";
@@ -60,10 +60,12 @@ async function waitFor(cond: () => Promise<boolean>, timeoutMs: number): Promise
 describe("real Postgres: claims and queue under concurrency", opts, () => {
   it("concurrent migrators do not race (advisory lock)", async () => {
     const { db, drop } = await newRealPg(URL!, 30, { migrate: false });
+    const expected = (await listMigrations()).map((m) => m.version);
+    assert.ok(expected.length >= 1, "the migrations directory is not empty");
     const results = await Promise.all([migrate(db), migrate(db), migrate(db)]);
-    assert.deepEqual(results.flat(), ["0001"], "each pending version applied exactly once across the three migrators");
+    assert.deepEqual(results.flat().sort(), expected, "each pending version applied exactly once across the three migrators");
     const { rows } = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM schema_migrations");
-    assert.equal(rows[0]!.n, 1);
+    assert.equal(rows[0]!.n, expected.length);
     await drop();
   });
 
