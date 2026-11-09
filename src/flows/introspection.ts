@@ -19,6 +19,9 @@ import type { FlowsUserAccess, Principal } from "./routes.ts";
  * is treated as inactive (reason `audience`, `expired` or
  * `issued_in_future`).
  *
+ * The audience may be overridden per call (the Relayfile origin when the
+ * store verifies a run's Relayfile credential).
+ *
  * Answers are cached for at most `cacheSeconds` (never past the token's
  * `exp`), keyed by sha256 of the token, the audience and the workspace. Raw
  * tokens are never stored or logged. Transport failures are not cached.
@@ -46,6 +49,8 @@ export type ActiveIntrospection = {
   /** Issue time (seconds); absent when relay-control does not report it. */
   iat?: number;
   token_id: string;
+  /** Agent tokens only (e.g. `flows-run-<runId>` for a run's Relayfile credential). */
+  agent_name?: string;
 };
 
 export type Introspection = InactiveIntrospection | ActiveIntrospection;
@@ -54,7 +59,11 @@ export class IntrospectionUnavailable extends Error {
   override name = "IntrospectionUnavailable";
 }
 
-export type Introspector = (token: string, workspace?: string) => Promise<Introspection>;
+/**
+ * `audience` overrides the introspector's fixed audience for one call (the
+ * Relayfile origin when verifying a run's Relayfile credential).
+ */
+export type Introspector = (token: string, workspace?: string, audience?: string) => Promise<Introspection>;
 
 type Cached = { value: Introspection; until: number };
 
@@ -86,6 +95,7 @@ function parseAnswer(body: unknown): Introspection {
     ...(str("aud") ? { aud: str("aud")! } : {}),
     ...(typeof b.iat === "number" && Number.isFinite(b.iat) ? { iat: b.iat } : {}),
     token_id: tokenId,
+    ...(str("agent_name") ? { agent_name: str("agent_name")! } : {}),
   };
 }
 
@@ -117,11 +127,12 @@ export function createIntrospector(input: {
   const cache = new Map<string, Cached>();
   const endpoint = joinUrl(input.baseUrl, INTROSPECT_PATH);
 
-  return async (token, workspace) => {
+  return async (token, workspace, audienceOverride) => {
+    const audience = audienceOverride ?? input.audience;
     const key = createHash("sha256")
       .update(token)
       .update("\0")
-      .update(input.audience)
+      .update(audience)
       .update("\0")
       .update(workspace ?? "")
       .digest("hex");
@@ -135,7 +146,7 @@ export function createIntrospector(input: {
       response = await fetchImpl(endpoint, {
         method: "POST",
         headers: { authorization: `Bearer ${input.secret}`, "content-type": "application/json" },
-        body: JSON.stringify({ token, aud: input.audience, ...(workspace !== undefined ? { workspace } : {}) }),
+        body: JSON.stringify({ token, aud: audience, ...(workspace !== undefined ? { workspace } : {}) }),
         signal: AbortSignal.timeout(input.timeoutMs ?? 5_000),
       });
     } catch (error) {
@@ -146,7 +157,7 @@ export function createIntrospector(input: {
       throw new IntrospectionUnavailable(`introspection answered ${response.status}`);
     }
     const parsed = parseAnswer(await response.json().catch(() => null));
-    const failure = parsed.active ? claimFailure(parsed, input.audience, at) : null;
+    const failure = parsed.active ? claimFailure(parsed, audience, at) : null;
     const value: Introspection = failure ? { active: false, reason: failure } : parsed;
     let until = at + ttlMs;
     if (value.active) until = Math.min(until, value.exp * 1000);

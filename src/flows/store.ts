@@ -8,8 +8,16 @@ import {
   secureEqual,
   type EncryptionKeyring,
 } from "./crypto.ts";
-import type { CliCredentialBroker, RelaycastCredentialSource } from "./broker.ts";
-import { RelaycastBindingRefused, RelaycastCredentialsUnavailable } from "./broker.ts";
+import type {
+  CliCredentialBroker,
+  RelaycastCredentialSource,
+  RelayfileCredential,
+  RelayfileCredentialBroker,
+} from "./broker.ts";
+import { RelaycastBindingRefused, RelaycastCredentialsUnavailable, RelayfileCredentialRefused } from "./broker.ts";
+import type { Introspector } from "./introspection.ts";
+import { KNOWN_ISSUER_REFUSALS, MIN_REMAINING_MS, relayfileOrigin, verifyRelayfileCredential } from "./relayfile-credential.ts";
+import { relayfileMountPaths } from "./relayfile-mount.ts";
 import type { Logger } from "../observability/log.ts";
 import type { FlowsConfig } from "./config.ts";
 import { enqueueCredentialRevocation } from "./revoke-outbox.ts";
@@ -221,6 +229,13 @@ export class FlowsStore {
   cliCredentials?: CliCredentialBroker;
   /** The workspace's Relaycast binding, owned by relay-control. */
   relaycastCredentials?: RelaycastCredentialSource;
+  /** Issues each run's Relayfile credential (relay-control). */
+  relayfileCredentials?: RelayfileCredentialBroker;
+  /**
+   * relay-control introspection, used to verify a Relayfile credential
+   * before it is handed to a worker (per-call audience: the Relayfile origin).
+   */
+  introspect?: Introspector;
   /** Structured events (names and ids only, never secrets or error text). */
   logger?: Logger;
   /**
@@ -972,7 +987,9 @@ export class FlowsStore {
       `UPDATE selfhost_workflow_runs
           SET status = $2, error = COALESCE($3, error), summary = COALESCE($4, summary),
               exit_code = COALESCE($5, exit_code), duration_ms = COALESCE($6, duration_ms),
-              result = COALESCE($7::jsonb, result), completed_at = now(), updated_at = now()
+              result = COALESCE($7::jsonb, result), completed_at = now(), updated_at = now(),
+              relayfile_credential_ciphertext = NULL, relayfile_credential_id = NULL,
+              relayfile_credential_expires_at = NULL, relayfile_credential_refusal = NULL
         WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')
         RETURNING id`,
       [
@@ -989,7 +1006,9 @@ export class FlowsStore {
     // The run's CLI-credential references stop working with the run. They live
     // in relay-control, so the revocation is recorded here in the same
     // transaction and delivered by the revoke outbox (CliCredentialBroker
-    // revokeForRun), retried until relay-control acknowledges it.
+    // revokeForRun), retried until relay-control acknowledges it. The same
+    // revoke also ends the run's Relayfile credential, whose columns are
+    // cleared above.
     await enqueueCredentialRevocation(tx, runId);
     await this.appendEventTx(tx, runId, `run.${status}`, null, {
       ...(detail.error ? { error: detail.error } : {}),
@@ -1114,10 +1133,15 @@ export class FlowsStore {
       resume_run_id: string | null;
       start_from: string | null;
       previous_run_id: string | null;
+      relayfile_credential_ciphertext: string | null;
+      relayfile_credential_id: string | null;
+      relayfile_credential_expires_at: Date | string | null;
+      relayfile_credential_refusal: unknown;
     }>(
       `SELECT r.id, r.workspace_id, r.workflow, r.file_type, r.workflow_file_name, r.flow_id,
               r.env_secrets_ciphertext, r.code_object_key, r.resume_run_id, r.start_from,
-              r.previous_run_id
+              r.previous_run_id, r.relayfile_credential_ciphertext, r.relayfile_credential_id,
+              r.relayfile_credential_expires_at, r.relayfile_credential_refusal
          FROM selfhost_workflow_runs r
         WHERE r.id = $1`,
       [runId],
@@ -1151,6 +1175,8 @@ export class FlowsStore {
       }
     }
     const envSecrets = mergeRunEnvironment(workspaceEnvironment, runSecrets);
+    // Throws on a relay-control transport failure; the claim is released and retried.
+    const relayfile = await this.relayfileCredentialFor(row);
     // A reference, never the auth files: the worker fetches them with its own
     // worker credential, and the reference dies with the run.
     const cliReference = this.cliCredentials
@@ -1162,8 +1188,14 @@ export class FlowsStore {
       relayWorkspaceId: relaycast.relaycastWorkspaceId,
       relaycastApiKey: relaycast.relaycastApiKey,
       relaycastBaseUrl: this.config.workerRelaycastUrl ?? this.relaycastFallbackUrl,
-      relayfileUrl: this.config.workerRelayfileUrl,
-      relayfileToken: "",
+      ...(this.config.workerRelayfileUrl ? { relayfileUrl: this.config.workerRelayfileUrl } : {}),
+      ...(relayfile
+        ? {
+            relayfileToken: relayfile.relayfileToken,
+            relayfileTokenExpiresAt: relayfile.relayfileTokenExpiresAt,
+            relayfileMountPaths: relayfile.relayfileMountPaths,
+          }
+        : {}),
       workflow: row.workflow,
       fileType: row.file_type,
       sourceFileType: row.file_type,
@@ -1187,6 +1219,142 @@ export class FlowsStore {
       ...(row.resume_run_id ? { resumeRunId: row.resume_run_id } : {}),
       ...(row.start_from ? { startFrom: row.start_from } : {}),
       ...(row.previous_run_id ? { previousRunId: row.previous_run_id } : {}),
+    });
+  }
+
+  /**
+   * The run's Relayfile credential (docs/design/selfhost-flows-relayfile-token.md
+   * §2.3-§2.5): issued once per run, verified, stored encrypted and reused on
+   * redelivery; or null, with one `run.relayfile_credential_unavailable`
+   * event recorded the first time. Transport failures (BrokerUnavailable,
+   * IntrospectionUnavailable) propagate so the claim is released and the
+   * workspace held as for any relay-control outage.
+   */
+  private async relayfileCredentialFor(row: {
+    id: string;
+    workspace_id: string;
+    workflow: string;
+    file_type: "yaml" | "ts";
+    relayfile_credential_ciphertext: string | null;
+    relayfile_credential_id: string | null;
+    relayfile_credential_expires_at: Date | string | null;
+    relayfile_credential_refusal: unknown;
+  }): Promise<RelayfileCredential | null> {
+    const runId = row.id;
+    const workspaceId = row.workspace_id;
+    const hasRefusal = row.relayfile_credential_refusal !== null && row.relayfile_credential_refusal !== undefined;
+    const url = this.config.workerRelayfileUrl;
+    if (!url) {
+      // Expected for installations without Relayfile: run event, no operator log.
+      if (!hasRefusal) await this.recordRelayfileRefusal(runId, { code: "relayfile_not_configured" });
+      return null;
+    }
+    if (row.relayfile_credential_ciphertext) {
+      const expiresAt = row.relayfile_credential_expires_at === null ? NaN : new Date(row.relayfile_credential_expires_at).getTime();
+      if (Number.isFinite(expiresAt) && expiresAt >= Date.now() + MIN_REMAINING_MS) {
+        return JSON.parse(decryptSecret(row.relayfile_credential_ciphertext, this.keyring)) as RelayfileCredential;
+      }
+      // Redelivered after the TTL: a dead token would end the run at the
+      // worker. Drop it and issue again; the issuer revokes the earlier
+      // credential for the run, and run end revokes whatever is left.
+      await this.database.query(
+        `UPDATE selfhost_workflow_runs
+            SET relayfile_credential_ciphertext = NULL, relayfile_credential_id = NULL,
+                relayfile_credential_expires_at = NULL, updated_at = now()
+          WHERE id = $1 AND relayfile_credential_id IS NOT DISTINCT FROM $2`,
+        [runId, row.relayfile_credential_id],
+      );
+      this.logger?.event("flows_relayfile_credential_reissue", { area: "flows", workspaceId, runId });
+    }
+    if (hasRefusal) return null;
+    const origin = relayfileOrigin(url);
+    if (!this.relayfileCredentials || !this.introspect || !origin) {
+      await this.recordRelayfileRefusal(runId, { code: "relayfile_not_configured" });
+      return null;
+    }
+    const refuse = async (refusal: { code: string; reason?: string; status?: number }) => {
+      await this.recordRelayfileRefusal(runId, { code: refusal.code, ...(refusal.reason ? { reason: refusal.reason } : {}) });
+      this.logger?.event("flows_relayfile_credential_refused", {
+        area: "flows",
+        workspaceId,
+        runId,
+        ...(refusal.status !== undefined ? { status: refusal.status } : {}),
+        code: refusal.code,
+        ...(refusal.reason ? { reason: refusal.reason } : {}),
+      });
+      return null;
+    };
+    const mount = relayfileMountPaths({ runId, workflow: row.workflow, fileType: row.file_type });
+    if ("refusal" in mount) return refuse(mount.refusal);
+    let credential: RelayfileCredential;
+    try {
+      credential = await this.relayfileCredentials.issue({
+        workspaceId,
+        runId,
+        mountPaths: mount.mountPaths,
+        readOnly: false,
+        aud: url,
+      });
+    } catch (error) {
+      if (!(error instanceof RelayfileCredentialRefused)) throw error;
+      const code = KNOWN_ISSUER_REFUSALS.includes(error.code) ? error.code : `unknown_refusal:${error.status}`;
+      return refuse({ code, status: error.status });
+    }
+    const answer = await this.introspect(credential.relayfileToken, workspaceId, origin);
+    const failure = verifyRelayfileCredential({
+      credential,
+      answer,
+      runId,
+      workspaceId,
+      relayfileOrigin: origin,
+      requestedMountPaths: mount.mountPaths,
+      readOnly: false,
+      nowMs: Date.now(),
+    });
+    // Not revoked early: the shared revoke {runId} would also end the run's
+    // CLI-credential references. The token never left this process and is not
+    // stored; run end revokes it with everything else.
+    if (failure) return refuse({ code: "relayfile_credential_invalid", reason: failure });
+    const stored = await this.database.transaction(async (tx) => {
+      const updated = await tx.query(
+        `UPDATE selfhost_workflow_runs
+            SET relayfile_credential_ciphertext = $2, relayfile_credential_id = $3,
+                relayfile_credential_expires_at = $4, updated_at = now()
+          WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')
+          RETURNING id`,
+        [
+          runId,
+          encryptSecret(JSON.stringify(credential), this.keyring.active),
+          credential.credentialId,
+          new Date(Date.parse(credential.relayfileTokenExpiresAt)).toISOString(),
+        ],
+      );
+      // The run finished meanwhile: make sure the fresh credential is revoked too.
+      if (!updated.rows.length) await enqueueCredentialRevocation(tx, runId);
+      return updated.rows.length > 0;
+    });
+    if (!stored) throw new FlowsError(409, "run_finished", "Run already finished");
+    return credential;
+  }
+
+  /**
+   * Persists the run's "no Relayfile credential" decision and appends its one
+   * `run.relayfile_credential_unavailable` event.
+   */
+  private async recordRelayfileRefusal(
+    runId: string,
+    refusal: { code: string; reason?: string },
+  ): Promise<void> {
+    await this.database.transaction(async (tx) => {
+      const updated = await tx.query(
+        `UPDATE selfhost_workflow_runs SET relayfile_credential_refusal = $2::jsonb, updated_at = now()
+          WHERE id = $1 AND relayfile_credential_refusal IS NULL AND relayfile_credential_ciphertext IS NULL
+          RETURNING id`,
+        [runId, JSON.stringify(refusal)],
+      );
+      if (updated.rows.length) {
+        await this.appendEventTx(tx, runId, "run.relayfile_credential_unavailable", null, { ...refusal });
+      }
     });
   }
 

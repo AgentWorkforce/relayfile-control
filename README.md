@@ -147,6 +147,38 @@ check apply only to the secrets that are set.
   transaction. A worker delivers it with `revokeForRun`; only a 2xx removes
   the row, and anything else (including 404) is retried with capped
   exponential backoff.
+- **Relayfile credential (Flows-to-File).** When
+  `SELFHOST_FLOWS_WORKER_RELAYFILE_URL` is set, building a run's assignment
+  asks relay-control for a per-run `sh_fr_` credential:
+  `POST /internal/v1/flows/credentials/relayfile` with the broker bearer and
+  `{workspaceId, runId, mountPaths, readOnly: false, aud}`, where `aud` is
+  the Relayfile URL and `mountPaths` is the run root
+  `/workflows/runs/<runId>` followed by the YAML workflow's
+  `integrations` providers (`github`, `gitlab`, `jira`, `linear`,
+  `shortcut`, `slack`; `relayfile` and `subscriptions` are ignored), sorted.
+  The answer is introspected with `aud` = the Relayfile origin and must be
+  an active `agent` token named `flows-run-<runId>` for this credential id
+  and workspace, expiring at least 60 s from now and matching
+  `relayfileTokenExpiresAt` within 1 s, with exactly the scopes the mount
+  paths imply (read and write per path). A verified credential is stored
+  encrypted, reused on redelivery while at least 60 s of its TTL remain
+  (re-issued otherwise; the issuer revokes the earlier one), nulled when the run
+  finishes, and revoked by the same outbox `revoke {runId}` row. The
+  assignment payload then carries `relayfileToken`,
+  `relayfileTokenExpiresAt` and `relayfileMountPaths`; otherwise those
+  fields are absent (never empty) and the run gets one
+  `run.relayfile_credential_unavailable {code, reason?}` event. Codes:
+  `relayfile_not_configured` (no URL here, or the issuer says so),
+  `workspace_not_found`, `relayfile_audience_not_accepted`,
+  `invalid_request`, `invalid_mount_paths` (with
+  `reason: unmountable_provider:<name>` for a provider outside the list),
+  `relayfile_credential_invalid` (with the failed check as `reason`; the
+  credential never reaches a worker and is revoked with the run) and
+  `unknown_refusal:<status>`. Each
+  refusal except a missing URL also logs
+  `flows_relayfile_credential_refused`. An issuer 5xx, network failure or
+  introspection outage is not a refusal: the claim is released and the
+  workspace held, as for any broker outage.
 - **Telemetry.** relay-control calls `GET /internal/v1/telemetry/flows` with
   `Authorization: Bearer <RELAYFILE_CONTROL_TELEMETRY_SECRET>`. The secret
   is compared in constant time. The response is
