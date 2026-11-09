@@ -7,7 +7,9 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Fork PRs stay on GitHub-hosted runners (public repo); everything else uses
+    # the CI_LINUX_RUNNER repo variable when set, else ubuntu-latest.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     services:
       postgres:
         image: postgres:17
@@ -34,7 +36,9 @@ jobs:
         if: always()
         run: cat "$RUNNER_TEMP"/e2e-storm-report-*.md 2>/dev/null || cat /tmp/e2e-storm-report-*.md 2>/dev/null || true
   docker:
-    runs-on: ubuntu-latest
+    # Fork PRs stay on GitHub-hosted runners (public repo); everything else uses
+    # the CI_LINUX_RUNNER repo variable when set, else ubuntu-latest.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t relayfile-control:ci .
