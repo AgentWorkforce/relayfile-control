@@ -376,8 +376,8 @@ test("a relay-control outage during assignment holds the workspace with a growin
   const events = await cp.api(`/api/v1/workflows/runs/${run.body.runId}/events`, { token: tenant.memberToken });
   assert.deepEqual(
     events.body.events.map((event: { eventType: string }) => event.eventType),
-    ["run.queued", "run.assigned"],
-    "run.assigned is written once, for the delivered attempt only",
+    ["run.queued", "run.relayfile_credential_unavailable", "run.assigned"],
+    "run.assigned (and the Relayfile refusal) is written once, for the delivered attempt only",
   );
 
   // Success reset the delay: the next outage holds for the initial 1 s again.

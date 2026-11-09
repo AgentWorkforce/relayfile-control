@@ -178,8 +178,12 @@ test("fake worker: enroll → register → queue → assignment → ack → stat
   assert.equal(payload.relayWorkspaceId, "rc-primary");
   assert.equal(payload.relaycastApiKey, "rk_live_primary");
   assert.equal(payload.relaycastBaseUrl, "https://relaycast.selfhosted.company");
-  assert.equal(typeof payload.relayfileUrl, "string");
-  assert.equal(typeof payload.relayfileToken, "string");
+  // Relayfile is not configured here (SELFHOST_FLOWS_WORKER_RELAYFILE_URL
+  // empty): no URL, and the token fields are absent, never empty.
+  assert.equal("relayfileUrl" in payload, false);
+  assert.equal("relayfileToken" in payload, false);
+  assert.equal("relayfileTokenExpiresAt" in payload, false);
+  assert.equal("relayfileMountPaths" in payload, false);
   assert.equal(payload.workflow, DETERMINISTIC_FLOW);
   assert.equal(payload.fileType, "yaml");
   assert.equal(payload.sourceFileType, "yaml");
@@ -244,6 +248,7 @@ test("fake worker: enroll → register → queue → assignment → ack → stat
   const events = await api(`/api/v1/workflows/runs/${runId}/events`, { token: tenant.memberToken });
   assert.deepEqual(events.body.events.map((event: { eventType: string }) => event.eventType), [
     "run.queued",
+    "run.relayfile_credential_unavailable",
     "run.assigned",
     "run.acknowledged",
     "run.running",
