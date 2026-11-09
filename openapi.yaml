@@ -1270,7 +1270,7 @@ components:
           type: object
           properties:
             entitled: { type: boolean }
-            source: { enum: [relaycontrol, license_document, grace, null] }
+            source: { enum: [relaycontrol, license_document, grace, unconfigured, null] }
             reason: { type: string }
         ingressPaused: { type: boolean }
         role: { enum: [ingress, consumer, all] }

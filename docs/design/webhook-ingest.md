@@ -552,8 +552,14 @@ pause flag.
 
 ## 11. Entitlement (relayfile is a licence add-on)
 
-relayfile-control refuses to run its ingress unless the installation is
-entitled to `relayfile`:
+Entitlement is optional (decision A, 2026-11-09, consistent with dropping
+self-host licence gating): with no source configured (no
+`RELAYCONTROL_SERVICE_TOKEN` and no `RELAYCONTROL_LICENSE_DOC`/`_FILE`) the
+installation is entitled and `/readyz` reports
+`entitlement: {entitled: true, source: "unconfigured"}`. A bare
+`RELAYCONTROL_BASE_URL` does not configure a source (Flows share it). Once a
+source is configured, relayfile-control refuses to run its ingress unless the
+installation is entitled to `relayfile`:
 
 - At start and every `ENTITLEMENT_REFRESH_SECONDS` (default 300) it reads
   `GET <RELAYCONTROL_BASE_URL>/api/v1/license` (relaycontrol feature-switch

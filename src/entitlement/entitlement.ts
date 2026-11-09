@@ -21,7 +21,13 @@ async function readBounded(response: Response, max: number): Promise<string | nu
 }
 
 /**
- * §11 entitlement: relayfile is a licence add-on. Two sources, OR-ed:
+ * §11 entitlement: relayfile is a licence add-on. Entitlement is optional:
+ * an installation that configures no source (no service token and no
+ * licence document/file) is entitled, reported as `source: "unconfigured"`,
+ * consistent with dropping self-host licence gating (decision A, 2026-11-09).
+ * `RELAYCONTROL_BASE_URL` alone does not count: Flows share it with
+ * introspection and the credential broker. Once a source is configured it
+ * gates as before. Two sources, OR-ed:
  *  1. relaycontrol `GET /api/v1/license` with a service bearer, requiring
  *     `capabilities.relayfile === true`;
  *  2. an offline licence document verified locally (relaycontrol's format:
@@ -38,7 +44,7 @@ const MAX_DOCUMENT_BYTES = 16 * 1024;
 
 export type EntitlementStatus = {
   entitled: boolean;
-  source: "relaycontrol" | "license_document" | "grace" | null;
+  source: "relaycontrol" | "license_document" | "grace" | "unconfigured" | null;
   reason: string;
   checkedAt: string | null;
   lastGoodAt: string | null;
@@ -123,9 +129,13 @@ export type RefreshingEntitlementOptions = {
   now?: () => number;
 };
 
+export const UNCONFIGURED_REASON = "no_entitlement_source_configured";
+
 export class RefreshingEntitlement implements Entitlement {
-  private state: EntitlementStatus = { entitled: false, source: null, reason: "not_checked", checkedAt: null, lastGoodAt: null };
+  private state: EntitlementStatus;
   private lastGoodMs: number | null = null;
+  /** True when a service token or a licence document/file is set. */
+  readonly configured: boolean;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
   private key: KeyObject | null = null;
@@ -134,6 +144,11 @@ export class RefreshingEntitlement implements Entitlement {
   constructor(private readonly opts: RefreshingEntitlementOptions) {
     this.fetchImpl = opts.fetch ?? fetch;
     this.now = opts.now ?? (() => Date.now());
+    this.configured = Boolean(opts.serviceToken || opts.licenseDocument || opts.licenseFile);
+    // Unconfigured is entitled from construction so nothing is refused before the first refresh.
+    this.state = this.configured
+      ? { entitled: false, source: null, reason: "not_checked", checkedAt: null, lastGoodAt: null }
+      : { entitled: true, source: "unconfigured", reason: UNCONFIGURED_REASON, checkedAt: null, lastGoodAt: null };
     if (opts.publicKey) {
       try {
         this.key = parseLicensePublicKey(opts.publicKey);
@@ -152,9 +167,9 @@ export class RefreshingEntitlement implements Entitlement {
   }
 
   private async checkRemote(): Promise<{ ok: boolean; reason: string } | null> {
-    if (!this.opts.relaycontrolBaseUrl) return null;
-    // An unauthenticated capability answer is not trusted.
-    if (!this.opts.serviceToken) return { ok: false, reason: "relaycontrol_service_token_missing" };
+    // The remote source is configured by the service token; a bare base URL is Flows' (unconfigured here).
+    if (!this.opts.serviceToken) return null;
+    if (!this.opts.relaycontrolBaseUrl) return { ok: false, reason: "relaycontrol_base_url_missing" };
     try {
       const response = await this.fetchImpl(new URL("/api/v1/license", this.opts.relaycontrolBaseUrl), {
         headers: { authorization: `Bearer ${this.opts.serviceToken}` },
@@ -199,6 +214,10 @@ export class RefreshingEntitlement implements Entitlement {
 
   async refresh(): Promise<EntitlementStatus> {
     const nowMs = this.now();
+    if (!this.configured) {
+      this.state = { entitled: true, source: "unconfigured", reason: UNCONFIGURED_REASON, checkedAt: new Date(nowMs).toISOString(), lastGoodAt: null };
+      return this.status();
+    }
     const [remote, document] = await Promise.all([this.checkRemote(), this.checkDocument()]);
     const checkedAt = new Date(nowMs).toISOString();
     if (remote?.ok || document?.ok) {
@@ -212,7 +231,7 @@ export class RefreshingEntitlement implements Entitlement {
       };
       return this.status();
     }
-    const reason = [remote?.reason, document?.reason].filter(Boolean).join(",") || "no_entitlement_source_configured";
+    const reason = [remote?.reason, document?.reason].filter(Boolean).join(",") || UNCONFIGURED_REASON;
     // A definitive "not entitled" answer (or a tampered/invalid licence) ends grace for good:
     // the last good result is forgotten, so a later outage cannot re-entitle. Only unavailability is covered.
     const DEFINITIVE = new Set(["relaycontrol_not_entitled", "license_expired", "license_missing_feature", "license_bad_signature", "license_malformed", "license_too_large"]);

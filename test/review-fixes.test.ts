@@ -209,8 +209,12 @@ describe("review fixes: config, entitlement, admin, observability", () => {
     await writeFile(file, `${Buffer.from(JSON.stringify({ ...claims, seats: 99 })).toString("base64url")}.${sig.toString("base64url")}`);
     const s = await e.refresh();
     assert.deepEqual([s.entitled, s.reason], [false, "license_bad_signature"]);
-    const noToken = new RefreshingEntitlement({ relaycontrolBaseUrl: "http://127.0.0.1:9", graceSeconds: 0 });
-    assert.equal((await noToken.refresh()).reason, "relaycontrol_service_token_missing");
+    // P2 kept: an unauthenticated capability answer is never consulted. A bare base URL is Flows'
+    // (decision A: entitlement unconfigured → entitled); a token without a URL is configured and refused.
+    const noToken = new RefreshingEntitlement({ relaycontrolBaseUrl: "http://127.0.0.1:9", graceSeconds: 0, fetch: () => { throw new Error("must not fetch"); } });
+    assert.deepEqual([(await noToken.refresh()).source, noToken.isEntitled()], ["unconfigured", true]);
+    const noUrl = new RefreshingEntitlement({ serviceToken: "fixture-service-token", graceSeconds: 0 });
+    assert.deepEqual([(await noUrl.refresh()).reason, noUrl.isEntitled()], ["relaycontrol_base_url_missing", false]);
   });
 
   it("admin: a bad limit is 400 (not 503), and explicit replay ids default the limit to their count (P2)", async () => {
