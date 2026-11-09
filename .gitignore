@@ -3,3 +3,8 @@ dist/
 .tmp/
 *.log
 .env
+
+# test artifacts
+e2e-storm-report-*.md
+lic-*/
+mig-*/
