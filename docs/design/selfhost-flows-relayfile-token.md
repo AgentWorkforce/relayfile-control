@@ -1,9 +1,11 @@
 # relayfile-control: per-run Relayfile credential for self-host Flows workers
 
-Status: draft for coordination, 2026-11-09. Author: layered-relayfile
-(relayfile-control side). Counterpart: layered-control (relay-control side,
-the credential itself). Assigned by lead-desktop (task relay-245580040030216192).
-Decision owner for anything marked **DECISION**: Khaliq.
+Status: draft for coordination, 2026-11-09 (rev 2, reconciled with
+layered-control's issuer contract, relay message 245581962694701056).
+Author: layered-relayfile (relayfile-control side). Counterpart:
+layered-control (relay-control issuer; its doc lands as relay-control
+`docs/flows-relayfile-credential.md`). Assigned by lead-desktop (task
+relay-245580040030216192). Anything marked **DECISION** is Khaliq's.
 
 ## 0. Problem
 
@@ -17,225 +19,251 @@ relayfileToken: ""
 at `src/flows/store.ts:1166` (relay-control has the same literal at its
 `src/flows/store.ts:1126`). Cloud filled this field with a RelayAuth
 `relay_pa_` path-scoped token; self-host has no RelayAuth, so the field was
-left empty when the Flows API was ported. The worker then mounts Relayfile
-with an empty bearer and fails late, inside the run, with an auth error that
-names neither the cause nor the owner.
-
-Two things are wrong and each has one owner:
+left empty when the Flows API was ported. The worker mounts Relayfile with an
+empty bearer and fails late, inside the run, with an auth error that names
+neither the cause nor the owner.
 
 | Gap | Owner |
 |-----|-------|
-| No per-run Relayfile credential exists in self-host. | layered-control (relay-control mints it). |
+| No per-run Relayfile credential exists in self-host. | layered-control (relay-control issues it). |
 | relayfile-control hands out whatever it has, including `""`, unverified. | layered-relayfile (this document). |
+| Worker launcher accepts only `relay_pa_` tokens. | asked of lead-desktop (§4). |
 
-Relayfile itself needs no change: since relayfile#568 (merged 7d50e49e) it
-verifies relaycontrol tokens through `POST /internal/v1/auth/introspect`
-(`RELAYFILE_AUTH_MODE=introspection|dual`, `RELAYCONTROL_INTERNAL_URL`).
+Relayfile's verifier needs no change in `introspection` mode: since
+relayfile#568 (merged 7d50e49e) it sends every bearer to relay-control's
+`POST /internal/v1/auth/introspect`. `dual` mode routes by prefix and must
+learn the new prefix (§3, a relayfile PR owned by layered-relayfile).
 
-## 1. The credential (contract layered-control produces)
+## 1. The credential (relay-control, layered-control's contract)
 
-Reuse the token class relaycontrol already has for Relayfile, so nothing
-new is needed in relayfile's verifier:
+Restated here so both sides review one text; relay-control's doc is the
+source if they ever differ.
 
 | Field | Value |
 |-------|-------|
-| Token class | workspace API token, prefix `sh_wk_`, purpose `relayfile-agent` (relay-control `src/admin/api-tokens.ts`). |
-| `agent_name` | `flows-run:<runId>` (fits `NODE_ID_PATTERN`: letters, digits, `.`, `_`, `:`, `-`). Relayfile attributes writes to this agent name. |
-| `aud` | the Relayfile public origin the worker will call, i.e. relayfile-control's `SELFHOST_FLOWS_WORKER_RELAYFILE_URL` normalized as an origin. Must be in relay-control's `SELFHOST_INTROSPECT_AUDIENCES`, otherwise introspection answers `audience`. |
-| `workspace` | the run's relaycontrol workspace id. |
-| `scopes` | the purpose's fixed set `fs:read fs:write sync:read sync:trigger` for phase 1 (see **DECISION D2** for path scoping). |
-| `exp` | issued TTL, see §2.3. Never "no expiry". |
-| Issuer | relay-control, through the existing Flows broker surface (bearer `RELAYFILE_CONTROL_BROKER_SECRET`), not the admin API-token routes: no user session is involved. |
+| Token | opaque bearer `sh_fr_<random>`, sha256 at rest, no refresh token, exactly one active per run (re-issue revokes the previous). |
+| Introspection | `principal_type: "agent"`, `agent_name: "flows-run-<runId>"`, `sub` = `token_id` = credential id, `scopes`, `aud`, `workspace`, `org`, `iat`, `exp`. Inactive: `unknown | revoked | expired | audience | workspace`. |
+| Scopes | per mount root `p`: `relayfile:fs:read:p`, `relayfile:fs:read:p/*`, and unless `readOnly` the same two `fs:write` scopes. Never `fs:*`, `sync:*`, `manage`, `*`. Matches relayfile's `scopePathMatches`: `p` is the exact path, `p/*` every descendant. |
+| `aud` | the worker-facing Relayfile origin, from relay-control's own `SELFHOST_FLOWS_WORKER_RELAYFILE_URL`; must be in `SELFHOST_INTROSPECT_AUDIENCES`. |
+| TTL | hard horizon `SELFHOST_FLOWS_RELAYFILE_CREDENTIAL_TTL_MS` (relay-control config, default 12 h, 5 min..24 h); the real end is revocation. |
 
-Broker contract (additions to `BROKER_PATHS` in `src/flows/broker.ts`;
-layered-control owns the server half on `feat/flows-broker-api`):
+Issue route, behind the existing `RELAYFILE_CONTROL_BROKER_SECRET` bearer:
 
 ```
-POST /internal/v1/flows/credentials/relayfile-run-token
-  { workspaceId, runId, aud, ttlSeconds }
-  200 { token, tokenId, agentName, aud, scopes[], expiresAt }
-  409 relayfile_run_token_exists      (runId already has a live token; see §2.2)
-  422 relayfile_aud_not_accepted      (aud not in SELFHOST_INTROSPECT_AUDIENCES)
-  404 workspace_not_found
-POST /internal/v1/flows/credentials/revoke   { runId }    (existing; MUST now
-  also revoke the run's relayfile-run token; stays idempotent)
+POST /internal/v1/flows/credentials/relayfile
+  { workspaceId, runId, mountPaths: string[], readOnly?: boolean }
+  200 { relayfileToken, relayfileTokenExpiresAt, relayfileMountPaths, scopes, aud }
+  400 invalid_request | invalid_mount_paths
+  404 relayfile_not_configured          (issuer has no Relayfile URL or no introspection secret)
+  409 relayfile_audience_not_accepted   (Relayfile origin not an accepted introspection audience)
+POST /internal/v1/flows/credentials/revoke { runId }
+  existing route; now also revokes the run's Relayfile credential; idempotent
 ```
 
-Requirements on the issuer:
+Mount-path rules (400 `invalid_mount_paths`): 1..16 paths, absolute,
+normalized, no `.`/`..`, no trailing slash, no `*`, at most 512 chars; the
+first path must be `/workflows/runs/<runId>` for this run (or
+`/workflows/schedules/<id>`).
 
-- Store only the token hash (as today for `sh_wk_`); the raw token crosses
-  the wire once, in the 200 body.
-- Bind the token to `runId` so `revoke { runId }` finds it. One live token
-  per run; re-issue is a 409, not a silent rotation (a redelivered
-  assignment must carry the same token, §2.2).
-- Introspection of this token behaves exactly like any `relayfile-agent`
-  token: `principal_type: "agent"`, `agent_name`, `scopes`, `aud`, `exp`,
-  `token_id`; inactive answers `expired | revoked | audience | workspace |
-  wrong-kind | unknown`.
-- Never log the token, its hash or the broker secret (same rule as
-  `introspect.ts`).
+Asks from this side, to settle before the relay-control PR goes READY:
+
+- **A1** Add `credentialId` to the 200 body. relayfile-control verifies
+  `token_id === credentialId` (§2.4) and logs the id, never the token.
+- **A2** Accept an optional `aud` in the request body and answer 409
+  `relayfile_audience_not_accepted` when it differs from the issuer's own
+  origin. Both services carry `SELFHOST_FLOWS_WORKER_RELAYFILE_URL`; a drift
+  between the two configs should fail at issue time, not at the worker.
+- **A3** Confirm that `revoke { runId }` for a run with no Relayfile
+  credential stays a 2xx (it must; relayfile-control calls it for every run).
 
 ## 2. relayfile-control side (this repository)
 
 ### 2.1 Invariant
 
 ```
-relayfileUrl !== ""  ⇒  relayfileToken is non-empty, issued for this run,
-                        and verified by introspection before dispatch
-relayfileUrl === ""  ⇒  relayfileToken === "" and the run carries one
-                        run.relayfile_unavailable event
+relayfileToken present  ⇒  non-empty, issued for this run, verified (§2.4),
+                           with relayfileTokenExpiresAt and relayfileMountPaths
+relayfileToken absent   ⇒  the run carries one run.relayfile_credential_unavailable
+                           event naming the code; the worker refuses Flows-to-File
+                           with that reason
 ```
 
 The literal `relayfileToken: ""` at `store.ts:1166` goes away. An empty
-token is never sent next to a non-empty URL.
+string is never sent; absence is the only "no credential" signal.
+`relayfileUrl` is sent whenever it is configured, with or without a token,
+so the worker can name the service it could not get a credential for.
 
-### 2.2 Issue once per run, reuse on redelivery
+### 2.2 Mount paths (Cloud semantics, computed here)
+
+`relayfileMountPaths = [runRoot, ...providerRoots]`, as Cloud's
+`workflowRelayfileMountConfig` (cloud `packages/web/lib/workflows/relayfile-mount.ts`):
+
+- `runRoot = /workflows/runs/<runId>`.
+- `providerRoots`: for YAML workflows, the keys of the top-level
+  `integrations:` map minus the reserved keys `relayfile` and
+  `subscriptions`, each resolved through the mountable allowlist
+  `github gitlab jira linear shortcut slack` to the adapter root
+  `/<provider>`, deduped and sorted. An unknown provider is a refusal
+  (code `invalid_mount_paths`, reason `unmountable_provider:<name>`),
+  not a silent drop, exactly as Cloud. TS workflows declare no providers.
+- Phase 1 does not narrow GitHub or GitLab to one repository: the run record
+  has no repository grant. See **DECISION D2**.
+- `readOnly` is `false` in phase 1; the run record has no read-only flag.
+
+The `yaml` package is already a dependency.
+
+### 2.3 Issue once per run, reuse on redelivery
 
 `workflowPayload(runId)` runs at claim (`store.ts:1261`) and again on
-redelivery of an unacked assignment (`store.ts:1206`). The token is therefore
-minted at most once per run and stored encrypted, like `env_secrets`:
+redelivery of an unacked assignment (`store.ts:1206`). The credential is
+therefore issued at most once per run and stored encrypted with the store
+keyring, like `env_secrets_ciphertext`:
 
 ```
 ALTER TABLE selfhost_workflow_runs
-  ADD COLUMN relayfile_token_ciphertext text,
-  ADD COLUMN relayfile_token_id         text,
-  ADD COLUMN relayfile_token_expires_at timestamptz;
+  ADD COLUMN relayfile_credential_ciphertext text,     -- the 200 body, encrypted
+  ADD COLUMN relayfile_credential_id         text,
+  ADD COLUMN relayfile_credential_expires_at timestamptz;
 ```
 
-- First `workflowPayload` call with the column empty: call the broker,
-  verify (§2.4), store ciphertext + id + expiry in the same transaction that
-  marks the assignment delivered, put the token in the payload.
-- Later calls: decrypt and reuse; re-verify only if `expires_at` is within
-  the verification lead (§2.4), never re-mint.
-- `finishRun` (completed, failed, cancelled, worker-revoked, queue timeout)
-  already enqueues `enqueueCredentialRevocation(tx, runId)`; the same outbox
-  row now also revokes the Relayfile token because relay-control's
-  `revoke { runId }` covers both. The ciphertext column is nulled in the
-  same transaction. No new outbox.
-
-### 2.3 TTL
-
-New config `SELFHOST_FLOWS_RELAYFILE_TOKEN_TTL_MS`, default 24 h, bounds
-[10 min, 7 d], parsed with the existing `duration()` helper in
-`src/flows/config.ts`. Revocation at terminal state is the real bound; the
-TTL caps the damage if the outbox never delivers. The payload gains
-`relayfileTokenExpiresAt` (ISO 8601), the field name the relayfile SDK and
-`relayfile-mount --creds-file` already read
-(`internal/delegatedauth/delegatedauth.go:43`).
+- First call with the column empty: compute mount paths (§2.2), call the
+  issuer, verify (§2.4), store, place the three fields in the payload.
+- Later calls: decrypt and reuse. Never re-issue for a live run; the
+  issuer's "re-issue revokes the previous" rule only matters if this
+  service crashed between issue and store, which then rotates harmlessly.
+- `finishRun` already enqueues `enqueueCredentialRevocation(tx, runId)`
+  (`src/flows/revoke-outbox.ts`); the same outbox row now also revokes the
+  Relayfile credential because relay-control's `revoke { runId }` covers
+  both. The ciphertext columns are nulled in the same transaction. No new
+  outbox, no new config.
 
 ### 2.4 Verification before dispatch
 
 relayfile-control verifies what it hands out with the introspection client
 it already has (`src/flows/introspection.ts`), with one change: the
-audience is a parameter instead of the fixed `RELAYFILE_CONTROL_PUBLIC_ORIGIN`,
-because this token's `aud` is Relayfile's origin, not ours. The call sends
-`{ token, aud: <relayfile origin>, workspace: <run workspace> }` and the
-answer must satisfy all of:
+audience becomes a per-call parameter, because this credential's `aud` is
+Relayfile's origin, not `RELAYFILE_CONTROL_PUBLIC_ORIGIN`. One call per run,
+`{ token, aud: <Relayfile origin>, workspace: <run workspace> }`; the answer
+must satisfy every row:
 
-| Check | Else |
-|-------|------|
-| `active === true` | refused, reason = introspection `reason` |
-| `principal_type === "agent"` and `agent_name === "flows-run:<runId>"` | refused `principal` |
-| `token_id === tokenId` from the 200 body | refused `token_id` |
-| `workspace` equals the run's workspace | refused `workspace` |
-| `aud` normalizes to the Relayfile origin | refused `audience` |
-| `exp` is at least `queueWaitMs + 60 s` in the future | refused `expires_too_soon` |
-| `scopes` ⊇ `fs:read` (phase 1 required set) | refused `scopes` |
+| Check | Else (reason) |
+|-------|---------------|
+| `active === true` | the introspection `reason` |
+| `principal_type === "agent"` and `agent_name === "flows-run-<runId>"` | `principal` |
+| `token_id === credentialId` (A1) | `credential_id` |
+| `workspace` equals the run's relaycontrol workspace | `workspace` |
+| `aud` normalizes to this service's `SELFHOST_FLOWS_WORKER_RELAYFILE_URL` origin | `audience` |
+| `exp` at least 60 s in the future and equal to `relayfileTokenExpiresAt` within 1 s | `expiry` |
+| `scopes` equals the issuer's `scopes` and every scope is `relayfile:fs:(read|write):<p>` or `<p>/*` for `p` in `relayfileMountPaths` | `scopes` |
 
 Raw tokens are never logged or cached beyond the existing sha256 cache key.
-A refused token is revoked straight away through the normal outbox row.
+A credential that fails verification is treated as unavailable (§2.5) and
+revoked at once through a normal outbox row.
 
 ### 2.5 "Refuse clearly"
 
-Two failure classes, mapped onto the holds that already exist in
-`claimNext` (`store.ts:1275-1299`):
+The run proceeds without a Relayfile credential; the refusal is recorded
+where the run owner looks and where the operator looks, and nothing from
+the token appears in either.
 
-| Situation | Error class | Effect |
-|-----------|-------------|--------|
-| Broker 4xx (`relayfile_aud_not_accepted`, `workspace_not_found`, 409, unknown code) or verification failed (§2.4) | `RelayfileCredentialRefused { status, code, reason }` (new, next to `RelaycastBindingRefused` in `broker.ts`) | claim released; workspace held `relaycastRefusalHoldMs`; log event `flows_relayfile_credential_refused { workspaceId, runId, status, code, reason, retryInMs }`; run event `run.relayfile_credential_refused { code, reason }` appended once per hold, so the run owner sees it in the run's event list. Nothing from the token in either. |
-| Broker or introspection transport failure / 5xx | existing `BrokerUnavailable` / `IntrospectionUnavailable` | existing exponential outage hold; no new logging. |
+| Situation | Code in the run event | Operator log event |
+|-----------|----------------------|--------------------|
+| Relayfile not configured here (`SELFHOST_FLOWS_WORKER_RELAYFILE_URL` empty) | `relayfile_not_configured` | none (expected state for installs without the add-on) |
+| Issuer 404 `relayfile_not_configured`, 409 `relayfile_audience_not_accepted`, 400 `invalid_mount_paths`, unknown 4xx | the issuer's code (`unknown_refusal:<status>` for unknown) | `flows_relayfile_credential_refused { workspaceId, runId, status, code }` |
+| Unmountable provider (§2.2) | `invalid_mount_paths` with `reason` | same, with `reason` |
+| Verification failed (§2.4) | `relayfile_credential_invalid` with `reason` | same, with `reason`, plus the outbox revocation |
+| Issuer or introspection transport failure / 5xx | not a refusal | existing exponential outage hold in `claimNext` (`store.ts:1275-1285`): claim released, run retried |
 
-Startup: when `SELFHOST_FLOWS_WORKER_RELAYFILE_URL` is set, the broker seam
-must be configured. `src/flows/wiring.ts:75-79` already fails startup
-without `RELAYFILE_CONTROL_BROKER_SECRET`, so no new check is needed; the
-doc states the dependency.
+Run event: `run.relayfile_credential_unavailable { code, reason? }`,
+appended once per run (the redelivery path reuses the stored "no
+credential" decision, so a run is not spammed). The worker is expected to
+refuse Flows-to-File with the same code (§4).
 
-Unconfigured install (`relayfileUrl === ""`): the payload carries both
-empty strings (worker compatibility: today's worker reads both keys) and the
-run gets one `run.relayfile_unavailable {}` event at first claim. See
-**DECISION D1**.
+Startup: `src/flows/wiring.ts:75-79` already refuses to start Flows without
+`RELAYFILE_CONTROL_BROKER_SECRET` and `RELAYCONTROL_INTROSPECT_SECRET`, so
+no new check is needed.
 
 ### 2.6 Worker-facing payload after this change
 
 ```
 relayfileUrl:            "https://relayfile.example"
-relayfileToken:          "sh_wk_…"
-relayfileTokenExpiresAt: "2026-11-10T12:00:00.000Z"
+relayfileToken:          "sh_fr_…"
+relayfileTokenExpiresAt: "2026-11-10T00:00:00.000Z"
+relayfileMountPaths:     ["/workflows/runs/<runId>", "/github", "/slack"]
 ```
 
-or, when Relayfile is not deployed for the install:
+or, when no credential could be issued:
 
 ```
-relayfileUrl: ""   relayfileToken: ""   (no relayfileTokenExpiresAt)
+relayfileUrl: "https://relayfile.example"      (or absent when unconfigured)
+(no relayfileToken, relayfileTokenExpiresAt, relayfileMountPaths)
 ```
+
+No refresh fields: the credential lives as long as the run.
 
 ### 2.7 Tests (table-driven, `node:test`)
 
-- payload builder: configured + broker 200 + introspection active ⇒ token in
-  payload, ciphertext stored, redelivery reuses the same token without a
-  second broker call; each §2.4 row refused ⇒ `RelayfileCredentialRefused`
-  with the named reason, claim back to `queued`, hold set, both events
-  emitted, no token substring in any event or log line.
-- broker client: request/response shapes, 409/422/404 mapping, 5xx ⇒
-  `BrokerUnavailable`.
-- finishRun: ciphertext nulled, one outbox row.
-- unconfigured: both empty strings, `run.relayfile_unavailable` once.
-- openapi: `relayfileTokenExpiresAt` added to the assignment payload schema;
-  `scripts`/contract check as the repo does today.
+- mount paths: run root only; YAML with each mountable provider; reserved
+  keys dropped; unknown provider refused; TS workflow has no providers;
+  dedupe and sort.
+- payload builder: issuer 200 + introspection active ⇒ three fields
+  present, ciphertext stored, redelivery reuses without a second issuer
+  call; each §2.4 row fails ⇒ fields absent, run event with the named
+  reason, revocation row enqueued; each §2.5 refusal row ⇒ fields absent,
+  run event with the code, log event, no hold; issuer 5xx ⇒ claim released
+  and outage hold as today. No test fixture token substring may appear in
+  any event payload or log line (asserted).
+- issuer client: request/response shapes, 400/404/409 mapping,
+  5xx ⇒ `BrokerUnavailable`.
+- finishRun: ciphertext nulled, exactly one outbox row.
+- openapi: the three payload fields added to the assignment payload schema.
 
-## 3. Relayfile side (no code change)
+## 3. Relayfile side (layered-relayfile, separate PR)
 
-The self-host Relayfile must run `RELAYFILE_AUTH_MODE=introspection` (or
-`dual` while RelayAuth JWKS is still around) with `RELAYCONTROL_INTERNAL_URL`,
-`RELAYCONTROL_INTROSPECT_SECRET` and its audience set to the same origin the
-token carries. The infra chart does not yet expose these slots
-(flagged to infra-kind-stack after relayfile#568). Positive introspection
-answers are cached for at most 60 s, so a revoked run token can be honoured
-for up to 60 s after `finishRun`; acceptable, documented.
+Relayfile must run `RELAYFILE_AUTH_MODE=introspection` or `dual` with
+`RELAYCONTROL_INTERNAL_URL`, `RELAYCONTROL_INTROSPECT_SECRET` and its
+audience equal to the credential's `aud`. `dual` mode routes bearers by
+prefix (`internal/httpapi/auth_introspection.go`,
+`relaycontrolTokenPrefixes`), so a small relayfile PR adds `sh_fr_` there
+with a test; `introspection` mode already works. The infra chart does not
+yet expose the introspection env slots (flagged to infra-kind-stack after
+relayfile#568). Positive introspection answers are cached for at most 60 s,
+so a revoked credential can be honoured for up to 60 s after `finishRun`.
 
-## 4. Worker side (not mine, flagged)
+## 4. Worker side (not mine, asked of lead-desktop)
 
 The Cloud launcher refuses any scoped workflow token that does not start
 with `relay_pa_` (cloud `packages/core/src/bootstrap/launcher.ts:1271`).
-If the self-host Flows worker shares that code path it will reject the
-`sh_wk_` token before mounting. lead-desktop: please confirm which worker
-build consumes `payload.relayfileToken` on self-host and whether that
-prefix check applies there.
+The self-host worker must accept `sh_fr_` when the control plane is
+relaycontrol, and must treat an absent `relayfileToken` as a clear refusal
+of Flows-to-File that names the run event's code. layered-control has asked
+lead-desktop for the owner; this document only depends on the field names.
 
 ## 5. Decisions needed
 
-- **D1** Unconfigured install: dispatch with both fields empty plus a
-  `run.relayfile_unavailable` event (recommended; Relayfile is an optional
-  paid add-on per Khaliq 2026-11-07), or refuse every run until Relayfile is
-  configured.
-- **D2** Scope width: phase 1 workspace-wide `relayfile-agent` scopes.
-  Path-scoped (`relayfile:fs:read:<path>`) needs the run to declare its mount
-  paths; relayfile-control does not parse the workflow today. Follow-up.
-- **D3** TTL default 24 h and the `queueWaitMs + 60 s` verification lead.
+- **D1** Unconfigured or refused credential: run proceeds without
+  Relayfile plus the run event (recommended; Relayfile is an optional paid
+  add-on per Khaliq 2026-11-07), or the claim is refused until the add-on
+  is configured.
+- **D2** Repository narrowing for GitHub/GitLab mounts needs a repository
+  grant on the run record. Follow-up after phase 1.
+- **D3** TTL default 12 h on the issuer side; relayfile-control adds no
+  knob.
 
 ## 6. Sequence
 
 ```
 worker ──claim──▶ relayfile-control
                    ├─ workflowPayload(run)
-                   │   ├─ (first time) POST broker relayfile-run-token ──▶ relay-control
-                   │   │              ◀── { token, tokenId, expiresAt }
-                   │   ├─ POST introspect { token, aud: relayfile origin, workspace }
-                   │   │              ◀── { active, agent_name, token_id, exp, scopes… }
-                   │   ├─ verify §2.4, store ciphertext, or refuse §2.5
-                   │   └─ payload { relayfileUrl, relayfileToken, relayfileTokenExpiresAt, … }
+                   │   ├─ mountPaths = [/workflows/runs/<runId>, /<provider>…]
+                   │   ├─ (first time) POST broker credentials/relayfile ──▶ relay-control
+                   │   │              ◀── { relayfileToken, …ExpiresAt, …MountPaths, scopes, aud, credentialId }
+                   │   ├─ POST introspect { token, aud: Relayfile origin, workspace }
+                   │   │              ◀── { active, agent_name, token_id, exp, scopes, aud, workspace }
+                   │   ├─ verify §2.4 and store, or record §2.5 and omit
+                   │   └─ payload { relayfileUrl, relayfileToken?, relayfileTokenExpiresAt?, relayfileMountPaths?, … }
                    ◀── assignment
-worker ──Bearer sh_wk_…──▶ relayfile ──introspect──▶ relay-control (568 path)
+worker ──Bearer sh_fr_…──▶ relayfile ──introspect──▶ relay-control (568 path)
 …
-reportStatus(terminal) ─▶ finishRun ─▶ outbox ─▶ POST broker revoke { runId } ─▶ relay-control
+reportStatus(terminal) ─▶ finishRun ─▶ outbox ─▶ POST broker credentials/revoke { runId } ─▶ relay-control
 ```
