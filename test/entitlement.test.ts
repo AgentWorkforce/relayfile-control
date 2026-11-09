@@ -43,11 +43,34 @@ describe("RefreshingEntitlement", () => {
     assert.equal((await e.refresh()).entitled, true);
     assert.equal(e.status().source, "license_document");
   });
-  it("nothing configured → not entitled", async () => {
+  it("nothing configured → entitled, source unconfigured (decision A), before and after refresh", async () => {
     const e = new RefreshingEntitlement({ graceSeconds: 60 });
+    assert.equal(e.configured, false);
+    assert.equal(e.isEntitled(), true, "entitled before the first refresh");
+    assert.deepEqual(e.status(), { entitled: true, source: "unconfigured", reason: "no_entitlement_source_configured", checkedAt: null, lastGoodAt: null });
     const s = await e.refresh();
-    assert.equal(s.entitled, false);
-    assert.equal(s.reason, "no_entitlement_source_configured");
+    assert.equal(s.entitled, true);
+    assert.equal(s.source, "unconfigured");
+    assert.equal(typeof s.checkedAt, "string");
+    assert.equal(s.lastGoodAt, null);
+  });
+  it("a bare relaycontrol base URL (Flows) does not configure entitlement", async () => {
+    const e = new RefreshingEntitlement({ relaycontrolBaseUrl: "http://127.0.0.1:9", graceSeconds: 60 });
+    assert.equal(e.configured, false);
+    assert.deepEqual([(await e.refresh()).entitled, e.status().source], [true, "unconfigured"]);
+  });
+  it("a configured source still gates: not entitled before refresh and on a bad answer", async () => {
+    const token = new RefreshingEntitlement({ serviceToken: "fixture-service-token", graceSeconds: 60 });
+    assert.equal(token.configured, true);
+    assert.equal(token.isEntitled(), false);
+    assert.equal(token.status().reason, "not_checked");
+    const s = await token.refresh();
+    assert.deepEqual([s.entitled, s.source, s.reason], [false, null, "relaycontrol_base_url_missing"]);
+    const file = new RefreshingEntitlement({ licenseFile: "/nonexistent/relayfile.licence", publicKey: rawPub, graceSeconds: 60 });
+    assert.equal(file.configured, true);
+    assert.deepEqual([(await file.refresh()).entitled, file.status().reason], [false, "license_file_unreadable"]);
+    const doc = new RefreshingEntitlement({ licenseDocument: licence(good), graceSeconds: 60 });
+    assert.deepEqual([(await doc.refresh()).entitled, doc.status().reason], [false, "license_public_key_missing"]);
   });
   it("relaycontrol capability (fake server), bearer sent, outage covered by grace, definitive no ends it", async () => {
     let mode: "yes" | "down" | "no" = "yes";

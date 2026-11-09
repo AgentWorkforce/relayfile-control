@@ -46,7 +46,7 @@ Every setting is an environment variable with a finite default; see
 | `RELAYFILE_BASE_URL`, `RELAYFILE_INTERNAL_HMAC_SECRET` | Relayfile target and the internal HMAC secret (same Secret as the Relayfile server) |
 | `RELAYFILE_CONTROL_ADMIN_TOKEN` | admin bearer (comma list for rotation) |
 | `RELAYFILE_CONTROL_PUBLIC_ORIGIN` | optional at startup; required when `FLOWS_ENABLED=true`. This service's absolute http(s) origin (no path, query or credentials); the audience it asks relay-control to check tokens against |
-| `RELAYCONTROL_BASE_URL` + `RELAYCONTROL_SERVICE_TOKEN`, or `RELAYCONTROL_LICENSE_DOC` / `RELAYCONTROL_LICENSE_FILE` + `RELAYCONTROL_LICENSE_PUBLIC_KEY` | entitlement. Without the `relayfile` capability, ingress answers `403 feature_not_licensed` and the consumer pauses |
+| `RELAYCONTROL_BASE_URL` + `RELAYCONTROL_SERVICE_TOKEN`, or `RELAYCONTROL_LICENSE_DOC` / `RELAYCONTROL_LICENSE_FILE` + `RELAYCONTROL_LICENSE_PUBLIC_KEY` | entitlement, optional. With neither a service token nor a licence document/file set the installation is entitled and `/readyz` reports `entitlement.source: "unconfigured"` (a bare `RELAYCONTROL_BASE_URL`, as Flows need, does not configure it). With a source set and without the `relayfile` capability, ingress answers `403 feature_not_licensed` and the consumer pauses |
 
 Backpressure is cloud#6175 final by default. Relayfile 429 gets one in-place
 retry for long-deadline providers and none for Slack/Jira; a final 429 becomes

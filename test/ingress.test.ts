@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { upsertBinding } from "../src/bindings/store.ts";
-import { fixtureConfig, sign, startApp, type TestApp } from "./support/harness.ts";
+import { createApp } from "../src/app.ts";
+import { RefreshingEntitlement } from "../src/entitlement/entitlement.ts";
+import { MemoryLogger } from "../src/observability/log.ts";
+import { fixtureConfig, listen, newPglite, sign, startApp, type TestApp } from "./support/harness.ts";
 
 const gh = (body: object, delivery = `d-${Math.random()}`, extra: Record<string, string> = {}) => {
   const raw = JSON.stringify(body);
@@ -238,6 +241,30 @@ describe("health, readiness, metrics, admin", () => {
     assert.equal(body.entitlement.entitled, false);
     assert.equal(body.migration.upToDate, true);
     await t.close();
+  });
+
+  it("/readyz reports entitlement=unconfigured and ingress is open when no entitlement source is set", async () => {
+    const db = await newPglite();
+    const config = fixtureConfig();
+    const entitlement = new RefreshingEntitlement({ graceSeconds: config.ENTITLEMENT_GRACE_SECONDS });
+    await entitlement.refresh();
+    const app = createApp({ config, db, logger: new MemoryLogger(), entitlement });
+    const pub = await listen(app.publicHandler);
+    try {
+      const r = await fetch(`${pub.url}/readyz`);
+      assert.equal(r.status, 200);
+      const body = await r.json();
+      assert.equal(body.ready, true);
+      assert.equal(body.entitlement.entitled, true);
+      assert.equal(body.entitlement.source, "unconfigured");
+      assert.equal(body.entitlement.reason, "no_entitlement_source_configured");
+      // Ingress is past the entitlement gate: an unsigned GitHub delivery is refused for its signature, not 403.
+      const refused = await fetch(`${pub.url}/api/v1/webhooks/github`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      assert.notEqual(refused.status, 403);
+      assert.notEqual(((await refused.json()) as { error?: string }).error, "feature_not_licensed");
+    } finally {
+      await pub.close();
+    }
   });
 
   it("/metrics only on the admin listener; admin requires the bearer", async () => {
