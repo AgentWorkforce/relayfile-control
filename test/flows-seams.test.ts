@@ -303,6 +303,50 @@ test("finishing a run enqueues a durable revocation; the outbox retries until th
   assert.deepEqual(await second.drain(), { delivered: 1, failed: 0 }, "an expired lease is redelivered");
 });
 
+test("the outbox RETRIES a broker 404 and deletes the row only on a 2xx", async (t) => {
+  const cp = await startControlPlane();
+  t.after(() => cp.stop());
+  const tenant = await seedTenant(cp);
+  const run = await cp.api("/api/v1/workflows/run", { method: "POST", token: tenant.memberToken, body: { workflow: FLOW, fileType: "yaml" } });
+  assert.equal(run.status, 201);
+  const cancelled = await cp.api(`/api/v1/workflows/runs/${run.body.runId}/cancel`, { method: "POST", token: tenant.memberToken });
+  assert.equal(cancelled.status, 200);
+  const pending = () => cp.database.query<{ run_id: string; attempts: number; last_error: string | null }>(
+    "SELECT run_id, attempts, last_error FROM selfhost_cli_credential_revocations",
+  );
+  assert.deepEqual((await pending()).rows.map((r) => r.run_id), [run.body.runId], "cancel enqueues one revocation");
+
+  // relay-control answers 404 (wrong route, wrong base URL, or a run it has
+  // never seen). That is NOT success: the row must survive and be retried.
+  const notFound = Object.assign(new FakeBroker(), {
+    revokeForRun: async (runId: string) => {
+      notFound.calls.push({ op: "revokeForRun", args: [runId] });
+      throw new BrokerError(404, "run_not_found", "no such run");
+    },
+  });
+  const notFoundLogger = new MemoryLogger();
+  const retrying = new RevokeOutbox({ db: cp.database, broker: notFound, logger: notFoundLogger, baseDelayMs: 0, maxDelayMs: 0 });
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    assert.deepEqual(await retrying.drain(), { delivered: 0, failed: 1 }, `404 attempt ${attempt} is a failure, not a delivery`);
+    const rows = (await pending()).rows;
+    assert.equal(rows.length, 1, `the row is still queued after 404 attempt ${attempt}`);
+    assert.equal(Number(rows[0]!.attempts), attempt);
+    assert.equal(rows[0]!.last_error, "run_not_found");
+  }
+  assert.equal(notFound.calls.filter((c) => c.op === "revokeForRun").length, 3, "each drain retried the broker");
+  assert.deepEqual(
+    notFoundLogger.named("flows_revoke_retry").map((e) => [e.status, e.reason, e.runId]),
+    [[404, "run_not_found", run.body.runId], [404, "run_not_found", run.body.runId], [404, "run_not_found", run.body.runId]],
+  );
+
+  // Only a 2xx from the broker deletes the row.
+  const accepting = new RevokeOutbox({ db: cp.database, broker: cp.broker, baseDelayMs: 0, maxDelayMs: 0 });
+  assert.deepEqual(await accepting.drain(), { delivered: 1, failed: 0 }, "a later 2xx delivers the same row");
+  assert.equal((await pending()).rows.length, 0, "the 2xx deleted the row");
+  assert.deepEqual(cp.broker.calls.filter((c) => c.op === "revokeForRun").map((c) => c.args[0]), [run.body.runId]);
+  assert.deepEqual(await accepting.drain(), { delivered: 0, failed: 0 }, "nothing left to deliver");
+});
+
 test("revoke backoff grows exponentially and is capped", () => {
   assert.equal(revokeRetryDelayMs(1, 5_000, 600_000), 5_000);
   assert.equal(revokeRetryDelayMs(2, 5_000, 600_000), 10_000);
