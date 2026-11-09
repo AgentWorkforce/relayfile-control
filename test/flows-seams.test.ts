@@ -50,7 +50,7 @@ test("Flows secrets: _FILE indirection, 32-byte telemetry minimum, FLOWS_ENABLED
   );
   assert.throws(() => loadConfig({ ...origin, RELAYFILE_CONTROL_TELEMETRY_SECRET: "short" }), /RELAYFILE_CONTROL_TELEMETRY_SECRET/);
   assert.equal(loadConfig({ ...origin, RELAYFILE_CONTROL_TELEMETRY_SECRET: SECRET }).RELAYFILE_CONTROL_TELEMETRY_SECRET, SECRET);
-  assert.throws(() => loadConfig({ ...origin, FLOWS_ENABLED: "true" }), /required when FLOWS_ENABLED/);
+  assert.throws(() => loadConfig({ ...origin, FLOWS_ENABLED: "true" }), /RELAYCONTROL_BASE_URL, RELAYCONTROL_INTROSPECT_SECRET, RELAYFILE_CONTROL_BROKER_SECRET, RELAYFILE_CONTROL_ENCRYPTION_KEY_ID, RELAYFILE_CONTROL_ENCRYPTION_KEY$/);
   const enabled = loadConfig({
     ...origin,
     FLOWS_ENABLED: "true",
