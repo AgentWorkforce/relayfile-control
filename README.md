@@ -100,6 +100,16 @@ introspection, broker, telemetry and runtime-verify secrets must all differ;
 startup refuses two equal values. The 32-byte minimum and the distinctness
 check apply only to the secrets that are set.
 
+New flow definitions and inline run submissions are parsed as TypeScript or a
+single YAML document before saving; duplicate YAML keys are rejected. Source
+errors answer 400 `flow_source_invalid` with only the format and numeric
+line/column, never a source excerpt. Missing/blank source or malformed request
+fields answer 400 `invalid_request`; source over 256 KiB answers 413
+`workflow_too_large`. A rejected edit preserves the prior definition, including
+when only its format changes. Invoking saved definitions and retrying or
+resuming persisted run snapshots queues their stored bytes without new syntax
+checks; blank/byte guards still apply.
+
 ### Seams
 
 - **Introspection (user routes).** Bearer tokens, plus the
