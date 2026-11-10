@@ -778,6 +778,39 @@ test("a fileType-only edit validates retained source and preserves the prior def
   assert.equal(current.body.flow.updatedAt, saved.body.flow.updatedAt);
 });
 
+test("renaming a legacy definition may echo its unchanged fileType without reparsing source", async (t) => {
+  const cp = await startControlPlane();
+  t.after(() => cp.stop());
+  const { api } = cp;
+  const tenant = await seedTenant(cp);
+  const legacySource = "steps: [unterminated";
+  for (const fileType of ["yaml", "ts"] as const) {
+    const saved = await api("/cloud/api/v1/flows", {
+      method: "POST", token: tenant.ownerToken,
+      body: { name: `legacy-rename-${fileType}`, fileType, source: fileType === "yaml" ? DETERMINISTIC_FLOW : "export default {};" },
+    });
+    assert.equal(saved.status, 201, saved.text);
+    const id = saved.body.flow.id;
+    await cp.database.query("UPDATE selfhost_flow_definitions SET source = $2 WHERE id = $1", [id, legacySource]);
+    const renamed = await api(`/cloud/api/v1/flows/${id}`, {
+      method: "PATCH", token: tenant.ownerToken,
+      body: { name: `renamed-${fileType}`, fileType },
+    });
+    assert.equal(renamed.status, 200, renamed.text);
+    assert.equal(renamed.body.flow.name, `renamed-${fileType}`);
+    assert.equal(renamed.body.flow.source, legacySource);
+    assert.equal(renamed.body.flow.fileType, fileType);
+    const changed = await api(`/cloud/api/v1/flows/${id}`, {
+      method: "PATCH", token: tenant.ownerToken,
+      body: { fileType: fileType === "yaml" ? "ts" : "yaml" },
+    });
+    assert.equal(changed.status, 400, changed.text);
+    assert.equal(changed.body.code, "flow_source_invalid");
+    const current = await api(`/cloud/api/v1/flows/${id}`, { token: tenant.ownerToken });
+    assert.deepEqual(current.body.flow, renamed.body.flow);
+  }
+});
+
 test("persisted legacy source remains invokable and retryable without bypassing new inline validation", async (t) => {
   const cp = await startControlPlane();
   t.after(() => cp.stop());

@@ -759,7 +759,7 @@ paths:
                   dispatchedTo:
                     type: [string, "null"]
         "400":
-          description: invalid_request (malformed body or unsupported runtime) | flow_source_invalid (new inline source has invalid TypeScript or YAML syntax; coordinates only)
+          description: invalid_request (malformed body) | runtime_unsupported (runtime other than worker) | flow_source_invalid (new inline source has invalid TypeScript or YAML syntax; coordinates only)
         "413":
           description: workflow_too_large (source exceeds 256 KiB)
         "404":

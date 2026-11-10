@@ -430,7 +430,8 @@ export class FlowsStore {
   }): Promise<(FlowRecord & { source: string; steps: DeclaredStep[] }) | null> {
     const existing = await this.getFlow(input.workspaceId, input.flowId);
     if (!existing) return null;
-    if (input.source !== undefined || input.fileType !== undefined) {
+    // Metadata edits must remain possible for definitions saved before syntax validation.
+    if (input.source !== undefined || (input.fileType !== undefined && input.fileType !== existing.fileType)) {
       checkSource(input.source ?? existing.source, input.fileType ?? existing.fileType);
     }
     const name = input.name !== undefined ? cleanName(input.name, "name", 100) : existing.name;
