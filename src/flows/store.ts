@@ -1,3 +1,5 @@
+import { parse as parseTypeScript } from "@babel/parser";
+import { parse as parseYaml } from "yaml";
 import { randomUUID } from "node:crypto";
 import type { Database, SqlExecutor } from "./database.ts";
 import {
@@ -201,10 +203,21 @@ export function workflowFileName(name: string, fileType: "yaml" | "ts"): string 
 }
 
 const MAX_SOURCE_BYTES = 256 * 1024;
-function checkSource(source: string): void {
+function checkSource(source: string, fileType: "yaml" | "ts"): void {
   if (!source.trim()) throw new FlowsError(400, "invalid_request", "workflow source is required");
   if (Buffer.byteLength(source) > MAX_SOURCE_BYTES) {
     throw new FlowsError(413, "workflow_too_large", "workflow source exceeds 256 KiB");
+  }
+  // Inspect only: never execute imports or user code while saving a flow.
+  try {
+    if (fileType === "ts") {
+      parseTypeScript(source, { sourceType: "module", plugins: ["typescript"], attachComment: false });
+    } else {
+      parseYaml(source, { maxAliasCount: 50 });
+    }
+  } catch (error) {
+    throw new FlowsError(400, "flow_source_invalid",
+      `Invalid ${fileType === "ts" ? "TypeScript" : "YAML"}: ${error instanceof Error ? error.message : "Check the flow source"}`);
   }
 }
 
@@ -345,7 +358,7 @@ export class FlowsStore {
     fileType: "yaml" | "ts";
     source: string;
   }): Promise<FlowRecord & { source: string; steps: DeclaredStep[] }> {
-    checkSource(input.source);
+    checkSource(input.source, input.fileType);
     const id = randomUUID();
     const name = cleanName(input.name, "name", 100);
     try {
@@ -382,7 +395,9 @@ export class FlowsStore {
   }): Promise<(FlowRecord & { source: string; steps: DeclaredStep[] }) | null> {
     const existing = await this.getFlow(input.workspaceId, input.flowId);
     if (!existing) return null;
-    if (input.source !== undefined) checkSource(input.source);
+    if (input.source !== undefined || input.fileType !== undefined) {
+      checkSource(input.source ?? existing.source, input.fileType ?? existing.fileType);
+    }
     const name = input.name !== undefined ? cleanName(input.name, "name", 100) : existing.name;
     try {
       await this.database.query(
@@ -719,7 +734,7 @@ export class FlowsStore {
     startFrom?: string;
     previousRunId?: string;
   }): Promise<{ run: RunRecord; accessToken?: string; callbackToken?: string; assignmentId?: string }> {
-    checkSource(input.workflow);
+    checkSource(input.workflow, input.fileType);
     const dispatchType = input.dispatchType ?? "worker";
     const summary = summarizeDefinition(input.workflow, input.fileType);
     const workflowName = cleanName(
