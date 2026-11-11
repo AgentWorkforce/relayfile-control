@@ -682,3 +682,181 @@ test("assignment payloads carry the workspace runtime environment at delivery ti
   assert.equal(await cp.flows.verifyRuntimeCredential("sh_wrk_enr_x"), null);
   assert.equal(await cp.flows.verifyRuntimeCredential(tenant.memberToken), null);
 });
+
+test("flow source syntax is checked before create/update, preserving the last valid definition", async (t) => {
+  const cp = await startControlPlane();
+  t.after(() => cp.stop());
+  const { api } = cp;
+  const tenant = await seedTenant(cp);
+  for (const [kind, fileType, source] of [
+    ["yaml", "yaml", "steps: [QA-PARSER-SECRET"],
+    ["typescript", "ts", "this is not valid TypeScript !!!"],
+    ["duplicate", "yaml", "secret: first\nsecret: QA-PARSER-SECRET"],
+    ["multidoc", "yaml", "secret: QA-PARSER-SECRET\n---\nname: another"],
+  ] as const) {
+    const invalid = await api("/cloud/api/v1/flows", {
+      method: "POST", token: tenant.ownerToken,
+      body: { name: `invalid-${kind}`, fileType, source },
+    });
+    assert.equal(invalid.status, 400, invalid.text);
+    assert.equal(invalid.body.code, "flow_source_invalid");
+    assert.doesNotMatch(invalid.text, /QA-PARSER-SECRET/);
+    assert.match(invalid.body.error, /^Invalid (TypeScript|YAML) syntax(?: at line \d+, column \d+)?\.$/);
+    const inline = await api("/cloud/api/v1/workflows/run", {
+      method: "POST", token: tenant.ownerToken, body: { fileType, workflow: source },
+    });
+    assert.equal(inline.status, 400, inline.text);
+    assert.equal(inline.body.code, "flow_source_invalid");
+    assert.doesNotMatch(inline.text, /QA-PARSER-SECRET/);
+  }
+  // A UTF-8 payload can fit the route's character cap but exceed the byte cap.
+  // Oversized invalid source must be refused before reaching a syntax parser.
+  const oversized = await api("/cloud/api/v1/flows", {
+    method: "POST", token: tenant.ownerToken,
+    body: { name: "oversized", fileType: "ts", source: "this is not valid TypeScript !!!" + "é".repeat(128 * 1024 + 1) },
+  });
+  assert.equal(oversized.status, 413, oversized.text);
+  assert.equal(oversized.body.code, "workflow_too_large");
+  for (const source of ["a".repeat(256 * 1024 + 1), "é".repeat(128 * 1024 + 1)]) {
+    const oversized = await api("/cloud/api/v1/flows", {
+      method: "POST", token: tenant.ownerToken,
+      body: { name: "too-large", fileType: "ts", source },
+    });
+    assert.equal(oversized.status, 413, oversized.text);
+    assert.equal(oversized.body.code, "workflow_too_large");
+    for (const path of ["/cloud/api/v1/workflows/run", "/cloud/api/v1/workflows/local-run"]) {
+      const run = await api(path, { method: "POST", token: tenant.ownerToken, body: { fileType: "ts", workflow: source } });
+      assert.equal(run.status, 413, run.text);
+      assert.equal(run.body.code, "workflow_too_large");
+    }
+  }
+  const source = 'type Input = { text: string }; export default async function run(input: Input) { return input.text; }';
+  const saved = await api("/cloud/api/v1/flows", {
+    method: "POST", token: tenant.ownerToken, body: { name: "valid-flow", fileType: "ts", source },
+  });
+  assert.equal(saved.status, 201, saved.text);
+  const id = saved.body.flow.id;
+  const invalid = await api(`/cloud/api/v1/flows/${id}`, {
+    method: "PATCH", token: tenant.ownerToken, body: { source: "this is not valid TypeScript !!!" },
+  });
+  assert.equal(invalid.status, 400, invalid.text);
+  assert.equal(invalid.body.code, "flow_source_invalid");
+  const current = await api(`/cloud/api/v1/flows/${id}`, { token: tenant.ownerToken });
+  assert.equal(current.body.flow.source, source);
+  assert.equal(current.body.flow.updatedAt, saved.body.flow.updatedAt);
+  for (const source of ["a".repeat(256 * 1024 + 1), "é".repeat(128 * 1024 + 1)]) {
+    const changed = await api(`/cloud/api/v1/flows/${id}`, {
+      method: "PATCH", token: tenant.ownerToken, body: { source },
+    });
+    assert.equal(changed.status, 413, changed.text);
+    assert.equal(changed.body.code, "workflow_too_large");
+  }
+  const count = await cp.database.query<{ count: number }>("SELECT count(*)::int AS count FROM selfhost_flow_definitions");
+  assert.equal(count.rows[0]!.count, 1);
+});
+
+
+test("a fileType-only edit validates retained source and preserves the prior definition", async (t) => {
+  const cp = await startControlPlane();
+  t.after(() => cp.stop());
+  const { api } = cp;
+  const tenant = await seedTenant(cp);
+  const saved = await api("/cloud/api/v1/flows", {
+    method: "POST", token: tenant.ownerToken,
+    body: { name: "yaml-flow", fileType: "yaml", source: DETERMINISTIC_FLOW },
+  });
+  assert.equal(saved.status, 201, saved.text);
+  const id = saved.body.flow.id;
+  const changed = await api(`/cloud/api/v1/flows/${id}`, {
+    method: "PATCH", token: tenant.ownerToken, body: { fileType: "ts" },
+  });
+  assert.equal(changed.status, 400, changed.text);
+  assert.equal(changed.body.code, "flow_source_invalid");
+  const current = await api(`/cloud/api/v1/flows/${id}`, { token: tenant.ownerToken });
+  assert.equal(current.body.flow.fileType, "yaml");
+  assert.equal(current.body.flow.source, DETERMINISTIC_FLOW);
+  assert.equal(current.body.flow.updatedAt, saved.body.flow.updatedAt);
+});
+
+test("renaming a legacy definition may echo its unchanged fileType without reparsing source", async (t) => {
+  const cp = await startControlPlane();
+  t.after(() => cp.stop());
+  const { api } = cp;
+  const tenant = await seedTenant(cp);
+  const legacySource = "steps: [unterminated";
+  for (const fileType of ["yaml", "ts"] as const) {
+    const saved = await api("/cloud/api/v1/flows", {
+      method: "POST", token: tenant.ownerToken,
+      body: { name: `legacy-rename-${fileType}`, fileType, source: fileType === "yaml" ? DETERMINISTIC_FLOW : "export default {};" },
+    });
+    assert.equal(saved.status, 201, saved.text);
+    const id = saved.body.flow.id;
+    await cp.database.query("UPDATE selfhost_flow_definitions SET source = $2 WHERE id = $1", [id, legacySource]);
+    const renamed = await api(`/cloud/api/v1/flows/${id}`, {
+      method: "PATCH", token: tenant.ownerToken,
+      body: { name: `renamed-${fileType}`, fileType },
+    });
+    assert.equal(renamed.status, 200, renamed.text);
+    assert.equal(renamed.body.flow.name, `renamed-${fileType}`);
+    assert.equal(renamed.body.flow.source, legacySource);
+    assert.equal(renamed.body.flow.fileType, fileType);
+    const changed = await api(`/cloud/api/v1/flows/${id}`, {
+      method: "PATCH", token: tenant.ownerToken,
+      body: { fileType: fileType === "yaml" ? "ts" : "yaml" },
+    });
+    assert.equal(changed.status, 400, changed.text);
+    assert.equal(changed.body.code, "flow_source_invalid");
+    const current = await api(`/cloud/api/v1/flows/${id}`, { token: tenant.ownerToken });
+    assert.deepEqual(current.body.flow, renamed.body.flow);
+  }
+});
+
+test("persisted legacy source remains invokable and retryable without bypassing new inline validation", async (t) => {
+  const cp = await startControlPlane();
+  t.after(() => cp.stop());
+  const { api } = cp;
+  const tenant = await seedTenant(cp);
+  for (const [index, fileType, source] of [
+    [0, "ts", "this is not valid TypeScript !!!"],
+    [1, "yaml", "name: original\nname: legacy-duplicate"],
+    [2, "yaml", "name: first\n---\nname: second"],
+  ] as const) {
+    const valid = fileType === "ts" ? "export default {};" : DETERMINISTIC_FLOW;
+    const saved = await api("/cloud/api/v1/flows", {
+      method: "POST", token: tenant.ownerToken,
+      body: { name: `legacy-${index}`, fileType, source: valid },
+    });
+    assert.equal(saved.status, 201, saved.text);
+    // Model definitions and run snapshots persisted before syntax validation.
+    await cp.database.query("UPDATE selfhost_flow_definitions SET source = $2 WHERE id = $1", [saved.body.flow.id, source]);
+    const original = await api(`/cloud/api/v1/flows/${saved.body.flow.id}/invoke`, {
+      method: "POST", token: tenant.ownerToken, body: {},
+    });
+    assert.equal(original.status, 201, original.text);
+    const runId = original.body.runId;
+    await cp.database.query("UPDATE selfhost_workflow_runs SET status = 'failed' WHERE id = $1", [runId]);
+    for (const mode of ["retry", "resume"]) {
+      const retry = await api(`/cloud/api/v1/workflows/runs/${runId}/${mode}`, {
+        method: "POST", token: tenant.ownerToken, body: {},
+      });
+      assert.equal(retry.status, 201, retry.text);
+      const snapshot = await api(`/cloud/api/v1/workflows/runs/${retry.body.runId}/workflow`, { token: tenant.ownerToken });
+      assert.equal(snapshot.body.workflow, source);
+    }
+    // A caller-provided lineage id must not make a new inline source trusted.
+    const inline = await api("/cloud/api/v1/workflows/local-run", {
+      method: "POST", token: tenant.ownerToken,
+      body: { fileType, workflow: source, resumedFromRunId: runId },
+    });
+    assert.equal(inline.status, 400, inline.text);
+    assert.equal(inline.body.code, "flow_source_invalid");
+    for (const [badSource, status, code] of [["", 400, "invalid_request"], ["é".repeat(128 * 1024 + 1), 413, "workflow_too_large"]] as const) {
+      await cp.database.query("UPDATE selfhost_workflow_runs SET workflow = $2 WHERE id = $1", [runId, badSource]);
+      const retry = await api(`/cloud/api/v1/workflows/runs/${runId}/retry`, {
+        method: "POST", token: tenant.ownerToken, body: {},
+      });
+      assert.equal(retry.status, status, retry.text);
+      assert.equal(retry.body.code, code);
+    }
+  }
+});

@@ -41,6 +41,8 @@ export type FlowsUserAccess = (
 }>;
 
 const JSON_LIMIT = 4 * 1024 * 1024;
+// Source fields keep this body bound here; the store enforces their 256 KiB
+// UTF-8 byte cap before parsing and returns workflow_too_large consistently.
 
 function send(response: ServerResponse, status: number, body: unknown): void {
   response.writeHead(status, {
@@ -530,7 +532,7 @@ export function createFlowsHandler(deps: {
           name: str(body, "name", true, 100),
           description: str(body, "description", false, 1_000),
           fileType: fileTypeOf(body.fileType, "yaml"),
-          source: str(body, "source", true, 262_144),
+          source: str(body, "source", true, JSON_LIMIT),
         });
         send(response, 201, { flow });
         return true;
@@ -555,7 +557,7 @@ export function createFlowsHandler(deps: {
           name: str(body, "name", false, 100),
           description: body.description === null ? null : str(body, "description", false, 1_000),
           fileType: body.fileType === undefined ? undefined : fileTypeOf(body.fileType),
-          source: str(body, "source", false, 262_144),
+          source: str(body, "source", false, JSON_LIMIT),
         });
         if (!flow) throw new FlowsError(404, "flow_not_found", "Flow not found");
         send(response, 200, { flow });
@@ -627,7 +629,7 @@ export function createFlowsHandler(deps: {
         userId: access.principal.userId,
         userEmail: access.principal.email,
         flowId: flow?.id ?? null,
-        workflow: flow?.source ?? str(body, "workflow", true, 262_144),
+        workflow: flow?.source ?? str(body, "workflow", true, JSON_LIMIT),
         fileType: flow?.fileType ?? fileTypeOf(body.fileType),
         workflowName: flow?.name ?? str(body, "name", false, 200),
         workflowFileName: str(body, "workflowFileName", false, 200),
@@ -673,7 +675,7 @@ export function createFlowsHandler(deps: {
         workspaceId: access.workspace.id,
         userId: access.principal.userId,
         userEmail: access.principal.email,
-        workflow: str(body, "workflow", true, 262_144),
+        workflow: str(body, "workflow", true, JSON_LIMIT),
         fileType: fileTypeOf(body.fileType),
         dispatchType: "local",
         trigger: "local",

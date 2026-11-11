@@ -1,3 +1,5 @@
+import { parse as parseTypeScript } from "@babel/parser";
+import { parse as parseYaml } from "yaml";
 import { randomUUID } from "node:crypto";
 import type { Database, SqlExecutor } from "./database.ts";
 import {
@@ -153,6 +155,31 @@ export type RunEvent = {
   createdAt: string;
 };
 
+type CreateRunInput = {
+  workspaceId: string;
+  userId: string | null;
+  /** Snapshot of the creator's email (relay-control owns users). */
+  userEmail?: string | null;
+  flowId?: string | null;
+  workflow: string;
+  fileType: "yaml" | "ts";
+  workflowName?: string;
+  workflowFileName?: string;
+  dispatchType?: "worker" | "local";
+  trigger?: string;
+  inputs?: unknown;
+  envSecrets?: Record<string, string>;
+  codeArchive?: Buffer;
+  workerId?: string;
+  workerName?: string;
+  tags?: string[];
+  resumedFromRunId?: string;
+  resumeRunId?: string;
+  startFrom?: string;
+  previousRunId?: string;
+};
+type CreateRunResult = { run: RunRecord; accessToken?: string; callbackToken?: string; assignmentId?: string };
+
 type Row = Record<string, unknown>;
 
 const iso = (value: unknown): string | null =>
@@ -201,10 +228,31 @@ export function workflowFileName(name: string, fileType: "yaml" | "ts"): string 
 }
 
 const MAX_SOURCE_BYTES = 256 * 1024;
-function checkSource(source: string): void {
+function checkSource(source: string, fileType?: "yaml" | "ts"): void {
   if (!source.trim()) throw new FlowsError(400, "invalid_request", "workflow source is required");
   if (Buffer.byteLength(source) > MAX_SOURCE_BYTES) {
     throw new FlowsError(413, "workflow_too_large", "workflow source exceeds 256 KiB");
+  }
+  if (!fileType) return; // Persisted snapshots keep the pre-validation runtime contract.
+  // Inspect only: never execute imports or user code while saving a flow.
+  try {
+    if (fileType === "ts") {
+      parseTypeScript(source, { sourceType: "module", plugins: ["typescript"], attachComment: false });
+    } else {
+      parseYaml(source, { maxAliasCount: 50 });
+    }
+  } catch (error) {
+    // Parser messages (especially YAML code frames) can echo secret source.
+    // Return only the format and numeric coordinates, never parser text.
+    const failure = error as { loc?: { line?: number; column?: number }; linePos?: Array<{ line: number; col: number }> } | null;
+    const position = failure?.linePos?.[0];
+    const line = position?.line ?? failure?.loc?.line;
+    const column = position?.col ?? (typeof failure?.loc?.column === "number" ? failure.loc.column + 1 : undefined);
+    const at = typeof line === "number" && Number.isSafeInteger(line) && line > 0 &&
+      typeof column === "number" && Number.isSafeInteger(column) && column > 0
+      ? ` at line ${line}, column ${column}` : "";
+    throw new FlowsError(400, "flow_source_invalid",
+      `Invalid ${fileType === "ts" ? "TypeScript" : "YAML"} syntax${at}.`);
   }
 }
 
@@ -345,7 +393,7 @@ export class FlowsStore {
     fileType: "yaml" | "ts";
     source: string;
   }): Promise<FlowRecord & { source: string; steps: DeclaredStep[] }> {
-    checkSource(input.source);
+    checkSource(input.source, input.fileType);
     const id = randomUUID();
     const name = cleanName(input.name, "name", 100);
     try {
@@ -382,7 +430,10 @@ export class FlowsStore {
   }): Promise<(FlowRecord & { source: string; steps: DeclaredStep[] }) | null> {
     const existing = await this.getFlow(input.workspaceId, input.flowId);
     if (!existing) return null;
-    if (input.source !== undefined) checkSource(input.source);
+    // Metadata edits must remain possible for definitions saved before syntax validation.
+    if (input.source !== undefined || (input.fileType !== undefined && input.fileType !== existing.fileType)) {
+      checkSource(input.source ?? existing.source, input.fileType ?? existing.fileType);
+    }
     const name = input.name !== undefined ? cleanName(input.name, "name", 100) : existing.name;
     try {
       await this.database.query(
@@ -696,30 +747,13 @@ export class FlowsStore {
 
   // ----------------------------------------------------------------- runs
 
-  async createRun(input: {
-    workspaceId: string;
-    userId: string | null;
-    /** Snapshot of the creator's email (relay-control owns users). */
-    userEmail?: string | null;
-    flowId?: string | null;
-    workflow: string;
-    fileType: "yaml" | "ts";
-    workflowName?: string;
-    workflowFileName?: string;
-    dispatchType?: "worker" | "local";
-    trigger?: string;
-    inputs?: unknown;
-    envSecrets?: Record<string, string>;
-    codeArchive?: Buffer;
-    workerId?: string;
-    workerName?: string;
-    tags?: string[];
-    resumedFromRunId?: string;
-    resumeRunId?: string;
-    startFrom?: string;
-    previousRunId?: string;
-  }): Promise<{ run: RunRecord; accessToken?: string; callbackToken?: string; assignmentId?: string }> {
-    checkSource(input.workflow);
+  async createRun(input: CreateRunInput): Promise<CreateRunResult> {
+    // A flowId here is server-owned: routes fetch its persisted definition.
+    return this.createRunRecord(input, !input.flowId);
+  }
+
+  private async createRunRecord(input: CreateRunInput, validateSyntax: boolean): Promise<CreateRunResult> {
+    checkSource(input.workflow, validateSyntax ? input.fileType : undefined);
     const dispatchType = input.dispatchType ?? "worker";
     const summary = summarizeDefinition(input.workflow, input.fileType);
     const workflowName = cleanName(
@@ -1074,7 +1108,7 @@ export class FlowsStore {
     const code = original.hasCodeArchive
       ? (await this.objects.get(input.runId, "code.tar.gz"))?.body
       : undefined;
-    const created = await this.createRun({
+    const created = await this.createRunRecord({
       workspaceId: input.workspaceId,
       userId: input.userId,
       userEmail: input.userEmail,
@@ -1094,7 +1128,7 @@ export class FlowsStore {
       // run id, which the worker protocol never reports, so a resume re-queues
       // the definition and may skip ahead with `--start-from <step>`.
       ...(input.mode === "resume" && input.startFrom ? { startFrom: input.startFrom } : {}),
-    });
+    }, false);
     return { run: created.run, assignmentId: created.assignmentId };
   }
 

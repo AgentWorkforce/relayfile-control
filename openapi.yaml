@@ -650,6 +650,10 @@ paths:
             schema:
               $ref: "#/components/schemas/FlowInput"
       responses:
+        "400":
+          description: invalid_request (malformed body) | flow_source_invalid (invalid TypeScript or YAML syntax; coordinates only)
+        "413":
+          description: workflow_too_large (source exceeds 256 KiB)
         "201":
           description: Created
         "409":
@@ -674,6 +678,10 @@ paths:
             schema:
               $ref: "#/components/schemas/FlowInput"
       responses:
+        "400":
+          description: invalid_request (malformed body) | flow_source_invalid (invalid TypeScript or YAML syntax; coordinates only)
+        "413":
+          description: workflow_too_large (source exceeds 256 KiB)
         "200":
           description: Updated
     delete:
@@ -751,7 +759,9 @@ paths:
                   dispatchedTo:
                     type: [string, "null"]
         "400":
-          description: Invalid body, or a runtime other than `worker`
+          description: invalid_request (malformed body) | runtime_unsupported (runtime other than worker) | flow_source_invalid (new inline source has invalid TypeScript or YAML syntax; coordinates only)
+        "413":
+          description: workflow_too_large (source exceeds 256 KiB)
         "404":
           description: Requested worker or flow not found
   /api/v1/workflows/runs:
