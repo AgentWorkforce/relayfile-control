@@ -14,6 +14,7 @@ changing authentication, workspace policy or credential handling.
 | People, organizations, workspaces, membership, device/browser login, user sessions, workspace API credentials and introspection | `relay-control` |
 | Session-history access/handoff, Desktop/MCP session control, messaging and remote-agent connections, workspace configuration and canonical credential storage | `relay-control` |
 | Credential-broker server, run-bound subscription/Relayfile credential issuance and revocation, workspace Relaycast binding | `relay-control` |
+| Provider file/record storage, materialization and digests; provider contracts in adapter/provider packages | `relayfile` OSS runtime and its packages |
 | Hosted dashboard/UI, integration setup and the provider-readiness aggregation currently implemented in Cloud | `cloud` (UI ports in `relay-webapp` where implemented) |
 
 Implement Flows service fixes here, including source-validation and stored
@@ -51,8 +52,9 @@ needs an explicit owner and contract, not an incidental copy.
 
 ## Legacy code and cutover
 
-Older `relay-control` builds may still serve Flows. That is deployment state,
-not a change to canonical ownership. Any temporary legacy compatibility patch
+`relay-control`'s 0.5.x implementation still includes Flows handlers. Verify
+each deployed build and ingress before assuming a cutover. That deployment
+state does not change canonical ownership. Any temporary legacy compatibility patch
 must have a verified active deployment and tracked cutover/retirement reason.
 Do not mirror every fix, reintroduce public Flows ownership in relay-control,
 or delete live legacy handlers automatically.
