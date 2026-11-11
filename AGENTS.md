@@ -3,7 +3,8 @@
 ## Service ownership
 
 `relayfile-control` owns Relayfile integration ingestion and the Flows service.
-Read the matching [relay-control boundary](../relay-control/AGENTS.md) before
+Read the matching [relay-control boundary](https://github.com/AgentWorkforce/relay-control/blob/main/AGENTS.md)
+(local checkout: `../relay-control/AGENTS.md`) before
 changing authentication, workspace policy or credential handling.
 
 | Responsibility | Canonical owner |
