@@ -8,6 +8,10 @@
 # ghcr.io/agentworkforce/relayfile-control tagged fast-<sha> only. It never
 # moves a channel tag (no :main, :latest, semver or sha-<short>, which infra
 # reads as main builds). Pin the digest printed in the run summary.
+#
+# No signed GitHub attestation is pushed: attest-build-provenance records the
+# dispatch commit, not the `ref` actually built. BuildKit's SBOM and max-mode
+# provenance (which read the checkout) are attached to the image.
 name: fast-path
 run-name: fast-path ${{ inputs.ref }} (${{ inputs.reason }})
 on:
@@ -71,8 +75,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -106,11 +108,6 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.image_version }}
           provenance: mode=max
           sbom: true
-      - uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
       - name: Summary
         env:
           REF: ${{ inputs.ref }}
