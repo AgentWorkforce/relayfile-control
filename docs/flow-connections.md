@@ -11,6 +11,23 @@ Provider connection management uses relay-control's existing workspace APIs:
   non-secret connection details and `canManage`.
 - `DELETE /cloud/api/v1/workspaces/{workspaceId}/integrations/{provider}`
   disconnects a provider with relay-control's existing owner/admin authorization.
+- `POST /cloud/api/v1/workspaces/{workspaceId}/integrations/connect-session`
+  starts native OAuth in self-hosted installs. API-key providers use the existing
+  provider `POST` with the catalog's `credentialFields`; secrets are never
+  returned to the dashboard.
+- `PATCH /cloud/api/v1/workspaces/{workspaceId}/integrations/{provider}/settings`
+  updates only the connection display name. It requires the selected
+  `connectionId`, as does the dashboard's disconnect request, so an old screen
+  cannot edit or disconnect a replacement account. Renaming does not change
+  provider permissions, tokens or service-account scope identifiers.
+
+Hosted Cloud dispatches setup to the selected Nango or Composio backend and
+looks up/deletes existing connections through their persisted backend identity.
+Authorization health is distinct from ingestion readiness: missing, inactive
+and unknown (including provider outages) are separate outcomes. Provider-specific
+permission editors are not a general metadata editor; unsupported scopes are
+rejected rather than silently saved to a default account. The local design
+preview remains an in-memory playground, separate from these real API paths.
 
 These requests must reach relay-control. The `/api/v1/flows`, `/api/v1/workers`
 and `/api/v1/workflows` families continue to reach relayfile-control. This UI
@@ -25,3 +42,7 @@ or delete a delivery binding as a substitute for revoking a provider connection.
 
 Existing runs may already hold issued credentials. Disconnect does not cancel
 those runs. A subsequent run that needs the connection must connect again.
+
+Cloud settings and disconnect requests identify the selected persisted row and
+connection ID. Conditional local deletion preserves a replacement installed
+while provider cleanup is in flight; the UI reloads the surviving connection.
