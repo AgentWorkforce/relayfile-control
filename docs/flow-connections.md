@@ -27,6 +27,8 @@ Hosted Cloud dispatches setup to the selected Nango or Composio backend and
 looks up/deletes existing connections through their persisted backend identity.
 Cloud also exposes an opaque saved-row `version`; the dashboard includes it on
 rename/disconnect so a same-ID reauthorization is rejected before provider deletion.
+Its dedicated connection revision advances for authorization/binding/name changes;
+background sync metadata and token refreshes do not invalidate the editor.
 Its local conditional deletion and disconnect tombstone commit in one transaction;
 a lost revision writes neither a tombstone nor a local credential revocation.
 The external provider API has no grant-version conditional delete, so a
