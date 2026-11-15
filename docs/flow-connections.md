@@ -18,7 +18,9 @@ Provider connection management uses relay-control's existing workspace APIs:
 - `PATCH /cloud/api/v1/workspaces/{workspaceId}/integrations/{provider}/settings`
   updates only the connection display name. It requires the selected
   `connectionId`, as does the dashboard's disconnect request, so an old screen
-  cannot edit or disconnect a replacement account. Renaming does not change
+  cannot edit or disconnect a replacement account. Native records also expose
+  an opaque `version` edit token: reconnects retain their row ID, so the UI sends
+  both the ID and version for conditional writes under a row lock. Renaming does not change
   provider permissions, tokens or service-account scope identifiers.
 
 Hosted Cloud dispatches setup to the selected Nango or Composio backend and
