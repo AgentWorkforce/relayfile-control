@@ -62,7 +62,11 @@ test("RELAYFILE_CONTROL_PUBLIC_ORIGIN and RELAYCONTROL_BASE_URL must be absolute
 
 test("Flows secrets: _FILE indirection, 32-byte minimums, distinct values, FLOWS_ENABLED requirements", () => {
   const origin = { RELAYFILE_CONTROL_PUBLIC_ORIGIN: "https://files.example.com" };
-  const files: Record<string, string> = { "/run/secrets/broker": "broker-secret\n", "/run/secrets/verify": `${"v".repeat(32)}\n` };
+  const files: Record<string, string> = {
+    "/run/secrets/broker": "broker-secret\n",
+    "/run/secrets/verify": `${"v".repeat(32)}\n`,
+    "/run/secrets/delete": `${"d".repeat(32)}\n`,
+  };
   const env = resolveFileSecrets({ ...origin, RELAYFILE_CONTROL_BROKER_SECRET_FILE: "/run/secrets/broker" }, (p) => files[p]!);
   assert.equal(env.RELAYFILE_CONTROL_BROKER_SECRET, "broker-secret");
   const verifyEnv = resolveFileSecrets({ RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET_FILE: "/run/secrets/verify" }, (p) => files[p]!);
@@ -71,7 +75,17 @@ test("Flows secrets: _FILE indirection, 32-byte minimums, distinct values, FLOWS
     loadConfig({ RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET: verifyEnv.RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET }).RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET,
     "v".repeat(32),
   );
-  for (const key of ["RELAYCONTROL_INTROSPECT_SECRET", "RELAYFILE_CONTROL_BROKER_SECRET", "RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET"]) {
+  const deleteEnv = resolveFileSecrets({ RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET_FILE: "/run/secrets/delete" }, (p) => files[p]!);
+  assert.equal(
+    loadConfig({ RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET: deleteEnv.RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET }).RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET,
+    "d".repeat(32),
+  );
+  for (const key of [
+    "RELAYCONTROL_INTROSPECT_SECRET",
+    "RELAYFILE_CONTROL_BROKER_SECRET",
+    "RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET",
+    "RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET",
+  ]) {
     assert.throws(() => loadConfig({ [key]: "x".repeat(31) }), new RegExp(key), key);
   }
   // No two of the static shared secrets may be equal.
@@ -87,6 +101,15 @@ test("Flows secrets: _FILE indirection, 32-byte minimums, distinct values, FLOWS
   assert.throws(
     () => loadConfig({ RELAYCONTROL_INTROSPECT_SECRET: shared, RELAYFILE_CONTROL_BROKER_SECRET: shared }),
     /invalid configuration: RELAYFILE_CONTROL_BROKER_SECRET$/,
+  );
+  // The workspace-delete secret is inbound; it must not equal the outbound broker secret (or any other).
+  assert.throws(
+    () => loadConfig({ RELAYFILE_CONTROL_BROKER_SECRET: shared, RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET: shared }),
+    /invalid configuration: RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET$/,
+  );
+  assert.throws(
+    () => loadConfig({ RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET: shared, RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET: shared }),
+    /invalid configuration: RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET$/,
   );
   assert.throws(
     () => resolveFileSecrets({ RELAYFILE_CONTROL_BROKER_SECRET: "x", RELAYFILE_CONTROL_BROKER_SECRET_FILE: "/run/secrets/broker" }, (p) => files[p]!),

@@ -13,10 +13,21 @@ import { presentedBearer, telemetrySecretMatches } from "./telemetry.ts";
  *   credential, else `{active: false}`. relay-control's admin
  *   runtime-environment route uses it to accept worker credentials.
  * - `DELETE /internal/v1/flows/workspaces/{id}`, bearer
- *   RELAYFILE_CONTROL_BROKER_SECRET. Deletes the workspace's Flows data and
- *   queues CLI-credential revocations for its runs. Idempotent: 200 with
- *   the counts deleted (all zero on a repeat).
+ *   RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET (unset = 404). Deletes the
+ *   workspace's Flows data and queues CLI-credential revocations for its
+ *   runs. Idempotent: 200 `{workspaceId, deleted}` (all counts zero on a
+ *   repeat); the echoed id is the one in the path.
  *
+ * Answer order: 404 `not_found` while the route's secret is unset, 405 on
+ * the wrong method, 401 on a bad bearer, then 404 `flows_not_enabled` when
+ * the secret verified but Flows are off here. relay-control's delete outbox
+ * completes a row only on a 200 naming its workspace or on
+ * `flows_not_enabled`, so a bare 404 (secret unset) is retried rather than
+ * taken as "nothing held".
+ *
+ * Each inbound route has its own secret. The broker secret this service
+ * presents to relay-control is never accepted here, so a leak of either
+ * side's outbound secret does not authorize calls in the other direction.
  * Secrets are compared in constant time and never logged.
  */
 export const RUNTIME_VERIFY_PATH = "/internal/v1/flows/runtime-credentials/verify";
@@ -26,7 +37,7 @@ const MAX_VERIFY_BODY = 8 * 1024;
 export type InternalFlowsDeps = {
   store: FlowsStore | undefined;
   runtimeVerifySecret: string | undefined;
-  brokerSecret: string | undefined;
+  workspaceDeleteSecret: string | undefined;
   logger: Logger;
 };
 
@@ -59,8 +70,8 @@ export function createInternalFlowsHandler(deps: InternalFlowsDeps) {
     const verify = path === RUNTIME_VERIFY_PATH;
     const workspace = verify ? null : WORKSPACE_PATH.exec(path);
     if (!verify && !workspace) return false;
-    const secret = verify ? deps.runtimeVerifySecret : deps.brokerSecret;
-    if (!secret || !deps.store) {
+    const secret = verify ? deps.runtimeVerifySecret : deps.workspaceDeleteSecret;
+    if (!secret) {
       request.resume();
       send(response, 404, { error: "not_found" });
       return true;
@@ -74,6 +85,11 @@ export function createInternalFlowsHandler(deps: InternalFlowsDeps) {
     if (!telemetrySecretMatches(presentedBearer(request), secret)) {
       request.resume();
       send(response, 401, { error: "unauthorized" });
+      return true;
+    }
+    if (!deps.store) {
+      request.resume();
+      send(response, 404, { error: "flows_not_enabled" });
       return true;
     }
     try {
