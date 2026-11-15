@@ -61,6 +61,11 @@ Secrets are never logged: the startup line reports each one only as `set` or `un
 
 ## Flows API
 
+The dashboard's **Flows → Connections** inspector uses relay-control's provider
+connection APIs. See [connection management](docs/flow-connections.md) for the
+read/disconnect contract and the distinction between credentials and this
+service's webhook delivery bindings.
+
 relayfile-control serves the Flows API that used to live in relay-control:
 flow definitions, worker enrollment and queues, runs, steps, logs, storage
 and artifacts. The route contracts are unchanged. Paths, methods, request and
