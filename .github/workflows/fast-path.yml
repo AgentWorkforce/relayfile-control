@@ -1,0 +1,124 @@
+# Fast path: check and publish the relayfile-control image on Blacksmith
+# runners, outside the shared GitHub-hosted queue. Anyone with write access
+# (people or agents) may start it; nothing runs until Khaliq approves the
+# fast-path environment.
+#
+# It runs the same checks as ci (typecheck, build, tests against Postgres 17)
+# and pushes a linux/amd64+linux/arm64 build to
+# ghcr.io/agentworkforce/relayfile-control tagged fast-<sha> only. It never
+# moves a channel tag (no :main, :latest, semver or sha-<short>, which infra
+# reads as main builds). Pin the digest printed in the run summary.
+#
+# No signed GitHub attestation is pushed: attest-build-provenance records the
+# dispatch commit, not the `ref` actually built. BuildKit's SBOM and max-mode
+# provenance (which read the checkout) are attached to the image.
+name: fast-path
+run-name: fast-path ${{ inputs.ref }} (${{ inputs.reason }})
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build (a PR branch is fine)
+        required: true
+        default: main
+      reason:
+        description: Why this needs the fast path
+        required: true
+permissions:
+  contents: read
+# run_id keeps a run that waits for approval from displacing (cancelling) another
+# pending dispatch of the same ref.
+concurrency:
+  group: fast-path-${{ inputs.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+env:
+  IMAGE: ghcr.io/agentworkforce/relayfile-control
+jobs:
+  test:
+    environment: fast-path
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rfc
+          POSTGRES_PASSWORD: rfc-ci-only
+          POSTGRES_DB: rfc_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U rfc" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      RELAYFILE_CONTROL_PG_TEST_URL: postgres://rfc:rfc-ci-only@127.0.0.1:5432/rfc_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      - name: e2e storm reports
+        if: always()
+        run: cat "$RUNNER_TEMP"/e2e-storm-report-*.md 2>/dev/null || cat /tmp/e2e-storm-report-*.md 2>/dev/null || true
+
+  image:
+    needs: test
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.test.outputs.sha }}
+          persist-credentials: false
+      - id: version
+        env:
+          SHA: ${{ needs.test.outputs.sha }}
+        run: echo "image_version=0.0.0-fast.${SHA:0:7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            IMAGE_REVISION=${{ needs.test.outputs.sha }}
+            IMAGE_VERSION=${{ steps.version.outputs.image_version }}
+          tags: ${{ env.IMAGE }}:fast-${{ needs.test.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.test.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.image_version }}
+          provenance: mode=max
+          sbom: true
+      - name: Summary
+        env:
+          REF: ${{ inputs.ref }}
+          SHA: ${{ needs.test.outputs.sha }}
+          REASON: ${{ inputs.reason }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### relayfile-control fast path"
+            echo "- ref: \`$REF\` at \`$SHA\`"
+            echo "- reason: $REASON"
+            echo "- image: \`${IMAGE}@${DIGEST}\` (tag fast-$SHA)"
+          } >> "$GITHUB_STEP_SUMMARY"
