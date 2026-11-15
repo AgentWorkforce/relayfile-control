@@ -127,7 +127,7 @@ export function createApp(deps: AppDeps): App {
   const internalFlows = createInternalFlowsHandler({
     store: deps.flows?.store,
     runtimeVerifySecret: deps.config.RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET,
-    brokerSecret: deps.config.RELAYFILE_CONTROL_BROKER_SECRET,
+    workspaceDeleteSecret: deps.config.RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET,
     logger: deps.logger,
   });
   const flowsHandler = deps.flows

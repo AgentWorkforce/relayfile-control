@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { BrokerError, BrokerUnavailable, httpRelaycastCredentialSource } from "../src/flows/broker.ts";
 import { claimFailure } from "../src/flows/introspection.ts";
+import { randomUUID } from "node:crypto";
+import { createApp } from "../src/app.ts";
+import { RefreshingEntitlement } from "../src/entitlement/entitlement.ts";
 import { MemoryLogger } from "../src/observability/log.ts";
 import { AUDIENCE, openQueue, seedTenant, startControlPlane } from "./support/flows.ts";
+import { fixtureConfig, listen, newPglite } from "./support/harness.ts";
 
 const FLOW = `version: '1.0'
 name: review-flow
@@ -18,6 +22,7 @@ workflows:
 `;
 const VERIFY_SECRET = "runtime-verify-secret-at-least-32-bytes";
 const BROKER_SECRET = "broker-secret-that-is-at-least-32-bytes";
+const DELETE_SECRET = "workspace-delete-secret-at-least-32-bytes";
 
 type ControlPlane = Awaited<ReturnType<typeof startControlPlane>>;
 
@@ -252,7 +257,10 @@ test("runtime-credentials verify: own secret, constant-time bearer, worker crede
 });
 
 test("internal workspace delete removes the workspace's Flows data and queues revocations", async (t) => {
-  const cp = await startControlPlane({}, { RELAYFILE_CONTROL_BROKER_SECRET: BROKER_SECRET, RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET: VERIFY_SECRET });
+  const cp = await startControlPlane(
+    {},
+    { RELAYFILE_CONTROL_BROKER_SECRET: BROKER_SECRET, RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET: VERIFY_SECRET, RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET: DELETE_SECRET },
+  );
   t.after(() => cp.stop());
   const tenant = await seedTenant(cp);
   const worker = await registerWorker(cp, tenant.ownerToken);
@@ -275,11 +283,12 @@ test("internal workspace delete removes the workspace's Flows data and queues re
 
   const path = `/internal/v1/flows/workspaces/${tenant.workspaceId}`;
   assert.equal((await cp.api(path, { method: "DELETE" })).status, 401);
-  assert.equal((await cp.api(path, { method: "DELETE", token: VERIFY_SECRET })).status, 401, "only the broker secret");
-  assert.equal((await cp.api(path, { token: BROKER_SECRET })).status, 405);
-  assert.equal((await cp.api("/internal/v1/flows/workspaces/not-a-uuid", { method: "DELETE", token: BROKER_SECRET })).status, 400);
+  assert.equal((await cp.api(path, { method: "DELETE", token: VERIFY_SECRET })).status, 401, "not the runtime-verify secret");
+  assert.equal((await cp.api(path, { method: "DELETE", token: BROKER_SECRET })).status, 401, "the broker secret this service presents is not accepted inbound");
+  assert.equal((await cp.api(path, { token: DELETE_SECRET })).status, 405);
+  assert.equal((await cp.api("/internal/v1/flows/workspaces/not-a-uuid", { method: "DELETE", token: DELETE_SECRET })).status, 400);
 
-  const deleted = await cp.api(path, { method: "DELETE", token: BROKER_SECRET });
+  const deleted = await cp.api(path, { method: "DELETE", token: DELETE_SECRET });
   assert.equal(deleted.status, 200);
   assert.deepEqual(deleted.body, {
     workspaceId: tenant.workspaceId,
@@ -300,8 +309,37 @@ test("internal workspace delete removes the workspace's Flows data and queues re
   // The deleted worker's credential stops working.
   assert.equal((await cp.api(`/api/v1/workers/${worker.workerId}/heartbeat`, { method: "POST", token: worker.workerToken })).status, 401);
 
-  const again = await cp.api(path, { method: "DELETE", token: BROKER_SECRET });
+  const again = await cp.api(path, { method: "DELETE", token: DELETE_SECRET });
   assert.deepEqual([again.status, again.body.deleted], [200, { flows: 0, runs: 0, workers: 0, enrollmentTokens: 0, revocationsQueued: 0 }]);
+});
+
+test("internal workspace delete: unset secret is a bare 404; a verified caller with Flows off gets flows_not_enabled", async (t) => {
+  // Secret unset (Flows on): 404 not_found before any bearer check. relay-control retries this.
+  const unset = await startControlPlane();
+  t.after(() => unset.stop());
+  const bare = await unset.api(`/internal/v1/flows/workspaces/${randomUUID()}`, { method: "DELETE", token: DELETE_SECRET });
+  assert.deepEqual([bare.status, bare.body], [404, { error: "not_found" }]);
+
+  // Secret set, Flows off (no FlowsDeps): the bearer is verified first, then 404 flows_not_enabled,
+  // which relay-control takes as "configured on both sides, nothing held".
+  const config = fixtureConfig({ RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET: DELETE_SECRET, RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET: VERIFY_SECRET });
+  const entitlement = new RefreshingEntitlement({ graceSeconds: config.ENTITLEMENT_GRACE_SECONDS });
+  await entitlement.refresh();
+  const app = createApp({ config, db: await newPglite(), logger: new MemoryLogger(), entitlement });
+  const pub = await listen(app.publicHandler);
+  t.after(() => pub.close());
+  const path = `${pub.url}/internal/v1/flows/workspaces/${randomUUID()}`;
+  assert.equal((await fetch(path, { method: "DELETE" })).status, 401, "no bearer");
+  assert.equal((await fetch(path, { method: "DELETE", headers: { authorization: `Bearer ${BROKER_SECRET}` } })).status, 401, "broker secret refused");
+  assert.equal((await fetch(path, { method: "GET", headers: { authorization: `Bearer ${DELETE_SECRET}` } })).status, 405);
+  const off = await fetch(path, { method: "DELETE", headers: { authorization: `Bearer ${DELETE_SECRET}` } });
+  assert.deepEqual([off.status, await off.json()], [404, { error: "flows_not_enabled" }]);
+  const verifyOff = await fetch(`${pub.url}/internal/v1/flows/runtime-credentials/verify`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${VERIFY_SECRET}`, "content-type": "application/json" },
+    body: JSON.stringify({ token: "sh_wrk_x" }),
+  });
+  assert.deepEqual([verifyOff.status, await verifyOff.json()], [404, { error: "flows_not_enabled" }], "same order on the verify route");
 });
 
 test("store errors are logged by name only", async (t) => {
@@ -391,7 +429,7 @@ test("a relay-control outage during assignment holds the workspace with a growin
 });
 
 test("an outage hold is cleared by workspace delete", async (t) => {
-  const cp = await startControlPlane({}, { RELAYFILE_CONTROL_BROKER_SECRET: BROKER_SECRET });
+  const cp = await startControlPlane({}, { RELAYFILE_CONTROL_BROKER_SECRET: BROKER_SECRET, RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET: DELETE_SECRET });
   t.after(() => cp.stop());
   const tenant = await seedTenant(cp);
   const store = cp.flows;
@@ -402,7 +440,7 @@ test("an outage hold is cleared by workspace delete", async (t) => {
     throw new BrokerUnavailable("relay-control answered 503");
   };
   await assert.rejects(store.claimNext({ id: worker.workerId, workspaceId: tenant.workspaceId, tags: [] }), { name: "BrokerUnavailable" });
-  assert.equal((await cp.api(`/internal/v1/flows/workspaces/${tenant.workspaceId}`, { method: "DELETE", token: BROKER_SECRET })).status, 200);
+  assert.equal((await cp.api(`/internal/v1/flows/workspaces/${tenant.workspaceId}`, { method: "DELETE", token: DELETE_SECRET })).status, 200);
   // The workspace starts over: a fresh worker and run are offered at once.
   store.relaycastCredentials = real;
   const fresh = await registerWorker(cp, tenant.ownerToken, "w-fresh");

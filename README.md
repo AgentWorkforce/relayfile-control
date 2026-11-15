@@ -78,7 +78,7 @@ required:
 | `RELAYFILE_CONTROL_PUBLIC_ORIGIN` | audience (`aud`) sent with every introspection request and checked on every answer |
 | `RELAYCONTROL_BASE_URL` | relay-control's origin (no path, query or credentials), for introspection and the credential broker. With Flows off it only needs to be an absolute http(s) URL, as before |
 | `RELAYCONTROL_INTROSPECT_SECRET` | at least 32 bytes; bearer for relay-control's introspection endpoint |
-| `RELAYFILE_CONTROL_BROKER_SECRET` | at least 32 bytes; sent as `Authorization: Bearer` on every credential-broker call to relay-control, and accepted on `DELETE /internal/v1/flows/workspaces/{id}` |
+| `RELAYFILE_CONTROL_BROKER_SECRET` | at least 32 bytes; sent as `Authorization: Bearer` on every credential-broker call to relay-control. Never accepted on an inbound route |
 | `RELAYFILE_CONTROL_ENCRYPTION_KEY_ID`, `RELAYFILE_CONTROL_ENCRYPTION_KEY` | key for run secrets and worker tokens at rest (32 bytes, hex or base64); `_PREVIOUS_KEY_ID` / `_PREVIOUS_KEY` keep the old key readable during rotation |
 | `SELFHOST_FLOWS_WORKER_RELAYCAST_URL` or `RELAYCAST_PUBLIC_URL` | the Relaycast URL workers are told to use |
 
@@ -88,6 +88,7 @@ Optional:
 |---|---|---|
 | `RELAYFILE_CONTROL_TELEMETRY_SECRET` | unset | at least 32 bytes; enables `GET /internal/v1/telemetry/flows` (unset: 404) |
 | `RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET` | unset | at least 32 bytes; enables `POST /internal/v1/flows/runtime-credentials/verify` (unset: 404) |
+| `RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET` | unset | at least 32 bytes; enables `DELETE /internal/v1/flows/workspaces/{id}` (unset: 404) |
 | `FLOWS_PUBLIC_BASE_URL` | the public origin | base URL put into links the API returns |
 | `FLOWS_INTROSPECTION_CACHE_SECONDS` | 30 | introspection cache lifetime, capped at 30 |
 | `FLOWS_REVOKE_OUTBOX_INTERVAL_MS` | 5000 | how often the revocation outbox is drained |
@@ -96,8 +97,11 @@ Optional:
 
 Every secret above can also be given as a file path in `<NAME>_FILE`.
 Setting both the value and `_FILE` is a configuration error. The
-introspection, broker, telemetry and runtime-verify secrets must all differ;
-startup refuses two equal values. The 32-byte minimum and the distinctness
+introspection, broker, telemetry, runtime-verify and workspace-delete secrets
+must all differ; startup refuses two equal values. Secrets this service
+presents to relay-control (introspection, broker) are never accepted on its
+own inbound routes, so a leak on one side cannot be replayed in the other
+direction. The 32-byte minimum and the distinctness
 check apply only to the secrets that are set.
 
 New flow definitions and inline run submissions are parsed as TypeScript or a
@@ -200,16 +204,23 @@ checks; blank/byte guards still apply.
   `{active: true, subject: "worker:<id>", workspaceId, scopes}`; anything
   else answers `{active: false}`.
 - **Workspace delete.** relay-control calls
-  `DELETE /internal/v1/flows/workspaces/{id}` with the broker secret when it
-  deletes a workspace. It removes the workspace's flows, runs (with their
-  secrets, events, steps, assignments and stored objects), workers and
-  enrollment tokens, and queues CLI-credential revocations for its runs, in
-  one transaction. It is idempotent: a repeat answers 200 with zero counts.
+  `DELETE /internal/v1/flows/workspaces/{id}` with
+  `Authorization: Bearer <RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET>` when
+  it deletes a workspace. The broker secret is not accepted (401). It
+  removes the workspace's flows, runs (with their secrets, events, steps,
+  assignments and stored objects), workers and enrollment tokens, and
+  queues CLI-credential revocations for its runs, in one transaction. It is idempotent: a repeat answers 200 with zero counts.
   With GCS storage the bucket objects are not removed.
 - **404 on the internal routes.** The runtime-verify and workspace delete
-  routes answer 404 both when their secret is unset and when Flows are off
-  (`FLOWS_ENABLED` unset). relay-control should treat that 404 as nothing
-  to do: this installation holds no Flows data to verify or delete.
+  routes answer 404 `{error: "not_found"}` while their secret is unset,
+  before any bearer check. With the secret set, a verified caller gets
+  404 `{error: "flows_not_enabled"}` when Flows are off here
+  (`FLOWS_ENABLED` unset): both sides are configured and this installation
+  holds no Flows data to verify or delete. relay-control's delete outbox
+  completes a row only on a 200 whose `workspaceId` is the id it sent, or
+  on `flows_not_enabled`; a bare `not_found`, 401, 403, 5xx or network
+  failure keeps the row and is retried, so a delete is never dropped
+  because the receiver was not yet configured.
 
 ### Assignment holds
 

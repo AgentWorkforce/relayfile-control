@@ -190,10 +190,12 @@ export const ConfigSchema = z.object({
   RELAYCONTROL_INTROSPECT_SECRET: longSecret,
   /**
    * Sent as the bearer on every call to relay-control's Flows credential
-   * broker, and verified on DELETE /internal/v1/flows/workspaces/{id}
-   * (at least 32 bytes).
+   * broker (at least 32 bytes). Never accepted on an inbound route: a
+   * secret this service presents must not also authorize calls to it.
    */
   RELAYFILE_CONTROL_BROKER_SECRET: longSecret,
+  /** Verified on DELETE /internal/v1/flows/workspaces/{id}. Unset disables the route (404). */
+  RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET: longSecret,
   /** Verified on GET /internal/v1/telemetry/flows. Unset disables the route (404). */
   RELAYFILE_CONTROL_TELEMETRY_SECRET: longSecret,
   /** Verified on POST /internal/v1/flows/runtime-credentials/verify. Unset disables the route (404). */
@@ -214,6 +216,7 @@ export const ConfigSchema = z.object({
     "RELAYFILE_CONTROL_BROKER_SECRET",
     "RELAYFILE_CONTROL_TELEMETRY_SECRET",
     "RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET",
+    "RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET",
   ] as const;
   distinct.forEach((key, index) => {
     const value = c[key];
@@ -259,6 +262,7 @@ export const FILE_SECRETS = [
   "RELAYFILE_CONTROL_BROKER_SECRET",
   "RELAYFILE_CONTROL_TELEMETRY_SECRET",
   "RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET",
+  "RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET",
   "RELAYFILE_CONTROL_ENCRYPTION_KEY",
   "RELAYFILE_CONTROL_ENCRYPTION_PREVIOUS_KEY",
 ] as const;
@@ -310,6 +314,7 @@ const SECRET_KEYS = new Set<keyof Config>([
   "RELAYFILE_CONTROL_BROKER_SECRET",
   "RELAYFILE_CONTROL_TELEMETRY_SECRET",
   "RELAYFILE_CONTROL_RUNTIME_VERIFY_SECRET",
+  "RELAYFILE_CONTROL_WORKSPACE_DELETE_SECRET",
   "RELAYFILE_CONTROL_ENCRYPTION_KEY",
   "RELAYFILE_CONTROL_ENCRYPTION_PREVIOUS_KEY",
 ]);
