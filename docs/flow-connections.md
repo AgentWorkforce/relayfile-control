@@ -20,11 +20,19 @@ Provider connection management uses relay-control's existing workspace APIs:
   `connectionId`, as does the dashboard's disconnect request, so an old screen
   cannot edit or disconnect a replacement account. Native records also expose
   an opaque `version` edit token: reconnects retain their row ID, so the UI sends
-  both the ID and version for conditional writes under a row lock. Renaming does not change
-  provider permissions, tokens or service-account scope identifiers.
+  both the ID and version for conditional writes under a row lock. Renaming
+  does not change provider permissions, tokens or service-account scope identifiers.
 
 Hosted Cloud dispatches setup to the selected Nango or Composio backend and
 looks up/deletes existing connections through their persisted backend identity.
+Cloud also exposes an opaque saved-row `version`; the dashboard includes it on
+rename/disconnect so a same-ID reauthorization is rejected before provider deletion.
+Its local conditional deletion and disconnect tombstone commit in one transaction;
+a lost revision writes neither a tombstone nor a local credential revocation.
+The external provider API has no grant-version conditional delete, so a
+reauthorization racing the network revoke still requires checking authorization.
+Session callers need owner/admin for rename and workspace disconnect; token
+callers retain the explicit control-scope policy.
 Authorization health is distinct from ingestion readiness: missing, inactive
 and unknown (including provider outages) are separate outcomes. Provider-specific
 permission editors are not a general metadata editor; unsupported scopes are
