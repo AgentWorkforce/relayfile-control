@@ -74,7 +74,9 @@ describe("database session settings", () => {
   it("accepts direct and Supabase session-mode URLs", () => {
     assert.doesNotThrow(() => assertSessionPoolMode("postgres://user:secret@db.example.com:5432/db"));
     assert.doesNotThrow(() =>
-      assertSessionPoolMode("postgres://user:secret@aws-1-us-east-1.pooler.supabase.com:5432/db"),
+      assertSessionPoolMode(
+        "postgres://user:secret@aws-1-us-west-2.pooler.supabase.com:5432/db?sslmode=require",
+      ),
     );
     assert.doesNotThrow(() =>
       assertSessionPoolMode("postgres://user:secret@db.example.com:5432/db?pgbouncer=false"),
