@@ -81,7 +81,7 @@ export const ConfigSchema = z.object({
   ADMIN_LISTEN: z.string().default("127.0.0.1:3101"),
   DATABASE_URL: optional,
   DATABASE_POOL_MAX: int(20, 1, 500),
-  /** Server-side statement_timeout for every pooled connection (bounds hung sweeps and blob reads). */
+  /** Server-side statement_timeout, applied once per session and locally in every transaction. */
   DATABASE_STATEMENT_TIMEOUT_MS: int(30_000, 1000, 3_600_000),
   MIGRATE_ON_START: bool(false),
 

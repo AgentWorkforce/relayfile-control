@@ -1,4 +1,5 @@
 import pg from "pg";
+import { parse as parseConnectionString } from "pg-connection-string";
 
 export type QueryResult<T> = { rows: T[]; rowCount: number };
 
@@ -20,24 +21,122 @@ export interface Db extends Queryable {
   close(): Promise<void>;
 }
 
+type SessionClient = { query(sql: string, params?: unknown[]): Promise<unknown> };
+
+async function setStatementTimeout(
+  client: SessionClient,
+  statementTimeoutMs: number | undefined,
+  local: boolean,
+): Promise<void> {
+  if (!statementTimeoutMs) return;
+  await client.query(`SELECT set_config($1, $2, ${local ? "true" : "false"})`, [
+    "statement_timeout",
+    `${statementTimeoutMs}ms`,
+  ]);
+}
+
+/** Apply the server-side bound for the lifetime of this database session. */
+export async function setSessionStatementTimeout(
+  client: { query(sql: string, params?: unknown[]): Promise<unknown> },
+  statementTimeoutMs: number | undefined,
+): Promise<void> {
+  await setStatementTimeout(client, statementTimeoutMs, false);
+}
+
+/** Apply the server-side bound locally to the current transaction. */
+export async function setTransactionStatementTimeout(
+  client: SessionClient,
+  statementTimeoutMs: number | undefined,
+): Promise<void> {
+  await setStatementTimeout(client, statementTimeoutMs, true);
+}
+
+/**
+ * Session-scoped settings are unsafe through transaction poolers: the setting
+ * can miss the next query and leak to another client that gets the backend.
+ */
+export function assertSessionPoolMode(connectionString: string): void {
+  let url: URL;
+  try {
+    url = new URL(connectionString);
+  } catch {
+    // Leave malformed or non-URL connection strings to pg's own validation.
+    return;
+  }
+  // Resolve host and port with the parser pg itself uses, so query-string
+  // overrides (including duplicates) are read exactly as the driver will.
+  let parsed: ReturnType<typeof parseConnectionString>;
+  try {
+    parsed = parseConnectionString(connectionString);
+  } catch {
+    return;
+  }
+  const hostname = String(parsed.host ?? "").trim().toLowerCase().replace(/\.+$/, "");
+  const port = String(parsed.port ?? "").trim();
+  const supabaseTransactionPort =
+    (hostname === "pooler.supabase.com" || hostname.endsWith(".pooler.supabase.com")) &&
+    port === "6543";
+  // pg ignores `pgbouncer`; it is an operator's declaration, so match any case.
+  const pgbouncerValue = [...url.searchParams.entries()].find(
+    ([key]) => key.toLowerCase() === "pgbouncer",
+  )?.[1];
+  const explicitTransactionMode =
+    pgbouncerValue !== undefined &&
+    ["1", "true", "yes", "on"].includes(pgbouncerValue.trim().toLowerCase());
+  if (supabaseTransactionPort || explicitTransactionMode) {
+    throw new Error(
+      "transaction-mode PostgreSQL poolers are unsupported; use a session-mode URL",
+    );
+  }
+}
+
 export function pgDb(connectionString: string, options: { max?: number; statementTimeoutMs?: number } = {}): Db {
+  assertSessionPoolMode(connectionString);
   const pool = new pg.Pool({
     connectionString,
     max: options.max ?? 20,
-    ...(options.statementTimeoutMs ? { statement_timeout: options.statementTimeoutMs } : {}),
   });
   // An idle client error (e.g. the server restarted) must not crash the process.
   pool.on("error", () => undefined);
+  // Nor may one on a checked-out client: pg-pool only listens while a client is
+  // idle (or inside pool.query). The failed query still rejects, and the pool
+  // discards the client on release because it is no longer queryable.
+  pool.on("connect", (client) => {
+    client.on("error", () => undefined);
+  });
+  const configuredClients = new WeakSet<pg.PoolClient>();
+  // Supavisor session mode drops libpq startup options. Apply the bound once to
+  // each physical client. A transaction-mode pool can swap its server session,
+  // so plain query()/exec() there also require an ALTER ROLE default; tx() sets
+  // the bound locally after BEGIN and does not rely on session affinity.
+  const checkout = async (): Promise<pg.PoolClient> => {
+    const client = await pool.connect();
+    if (configuredClients.has(client)) return client;
+    try {
+      await setSessionStatementTimeout(client, options.statementTimeoutMs);
+      configuredClients.add(client);
+      return client;
+    } catch (error) {
+      client.release(true);
+      throw error;
+    }
+  };
   return {
     async query<T>(sql: string, params?: unknown[]) {
-      const result = await pool.query(sql, params as unknown[]);
-      return { rows: result.rows as T[], rowCount: result.rowCount ?? 0 };
+      const client = await checkout();
+      try {
+        const result = await client.query(sql, params as unknown[]);
+        return { rows: result.rows as T[], rowCount: result.rowCount ?? 0 };
+      } finally {
+        client.release();
+      }
     },
     async tx<T>(fn: (q: Tx) => Promise<T>): Promise<T> {
-      const client = await pool.connect();
+      const client = await checkout();
       let broken = false;
       try {
         await client.query("BEGIN");
+        await setTransactionStatementTimeout(client, options.statementTimeoutMs);
         const q: Tx = {
           async query<R>(sql: string, params?: unknown[]) {
             const result = await client.query(sql, params as unknown[]);
@@ -60,7 +159,12 @@ export function pgDb(connectionString: string, options: { max?: number; statemen
       }
     },
     async exec(sql: string) {
-      await pool.query(sql);
+      const client = await checkout();
+      try {
+        await client.query(sql);
+      } finally {
+        client.release();
+      }
     },
     async close() {
       await pool.end();

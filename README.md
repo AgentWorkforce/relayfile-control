@@ -48,6 +48,15 @@ Every setting is an environment variable with a finite default; see
 | `RELAYFILE_CONTROL_PUBLIC_ORIGIN` | optional at startup; required when `FLOWS_ENABLED=true`. This service's absolute http(s) origin (no path, query or credentials); the audience it asks relay-control to check tokens against |
 | `RELAYCONTROL_BASE_URL` + `RELAYCONTROL_SERVICE_TOKEN`, or `RELAYCONTROL_LICENSE_DOC` / `RELAYCONTROL_LICENSE_FILE` + `RELAYCONTROL_LICENSE_PUBLIC_KEY` | entitlement, optional. With neither a service token nor a licence document/file set the installation is entitled and `/readyz` reports `entitlement.source: "unconfigured"` (a bare `RELAYCONTROL_BASE_URL`, as Flows need, does not configure it). With a source set and without the `relayfile` capability, ingress answers `403 feature_not_licensed` and the consumer pauses |
 
+`DATABASE_STATEMENT_TIMEOUT_MS` is installed once on each physical database
+session and again with transaction-local scope after every `BEGIN`. Supavisor
+session mode (`:5432`) preserves the session setting. Transaction-mode URLs are
+refused at startup when they use `*.pooler.supabase.com:6543` or declare
+`pgbouncer=true`: a session setting there can miss the next query and leak to
+another client. Use a session-mode URL. A role default such as
+`ALTER ROLE ... SET statement_timeout` would require a separate database-owner
+decision; this service does not mutate it.
+
 Backpressure is cloud#6175 final by default. Relayfile 429 gets one in-place
 retry for long-deadline providers and none for Slack/Jira; a final 429 becomes
 a queue retry that honours Retry-After (cap 86 400 s). Opt-in switches:

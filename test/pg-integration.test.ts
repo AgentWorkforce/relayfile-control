@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Consumer } from "../src/consumer/consumer.ts";
 import type { EnvelopeHandler } from "../src/consumer/envelope-handler.ts";
-import type { Db } from "../src/db/db.ts";
+import { type Db, pgDb } from "../src/db/db.ts";
 import { listMigrations, migrate } from "../src/db/migrate.ts";
 import { StaticEntitlement } from "../src/entitlement/entitlement.ts";
 import { MemoryLogger } from "../src/observability/log.ts";
@@ -21,6 +21,30 @@ import { fixtureConfig, newRealPg, sleep } from "./support/harness.ts";
 
 const URL = process.env.RELAYFILE_CONTROL_PG_TEST_URL;
 const opts = { skip: URL ? false : "RELAYFILE_CONTROL_PG_TEST_URL not set" };
+const POOLER_URL = process.env.RELAYFILE_CONTROL_POOLER_TEST_URL;
+const poolerOpts = {
+  skip: POOLER_URL ? false : "RELAYFILE_CONTROL_POOLER_TEST_URL not set",
+};
+
+describe("real Supavisor session pooler", poolerOpts, () => {
+  it("applies the statement timeout in-session before direct and transactional queries", async () => {
+    const db = pgDb(POOLER_URL!, { max: 1, statementTimeoutMs: 15_000 });
+    try {
+      assert.deepEqual(
+        (await db.query<{ statement_timeout: string }>("SHOW statement_timeout")).rows,
+        [{ statement_timeout: "15s" }],
+      );
+      await db.tx(async (tx) => {
+        assert.deepEqual(
+          (await tx.query<{ statement_timeout: string }>("SHOW statement_timeout")).rows,
+          [{ statement_timeout: "15s" }],
+        );
+      });
+    } finally {
+      await db.close();
+    }
+  });
+});
 
 function consumerWith(db: Db, handler: EnvelopeHandler, cfg: Record<string, string> = {}) {
   const config = fixtureConfig({ CONSUMER_IDLE_POLL_MS: "10", ...cfg });
