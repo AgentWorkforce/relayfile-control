@@ -30,15 +30,15 @@ describe("real Supavisor session pooler", poolerOpts, () => {
   it("applies the statement timeout in-session before direct and transactional queries", async () => {
     const db = pgDb(POOLER_URL!, { max: 1, statementTimeoutMs: 15_000 });
     try {
-      assert.deepEqual(await db.query<{ statement_timeout: string }>("SHOW statement_timeout"), {
-        rows: [{ statement_timeout: "15s" }],
-        rowCount: 1,
-      });
+      assert.deepEqual(
+        (await db.query<{ statement_timeout: string }>("SHOW statement_timeout")).rows,
+        [{ statement_timeout: "15s" }],
+      );
       await db.tx(async (tx) => {
-        assert.deepEqual(await tx.query<{ statement_timeout: string }>("SHOW statement_timeout"), {
-          rows: [{ statement_timeout: "15s" }],
-          rowCount: 1,
-        });
+        assert.deepEqual(
+          (await tx.query<{ statement_timeout: string }>("SHOW statement_timeout")).rows,
+          [{ statement_timeout: "15s" }],
+        );
       });
     } finally {
       await db.close();

@@ -20,15 +20,34 @@ export interface Db extends Queryable {
   close(): Promise<void>;
 }
 
-/** Apply the server-side bound in-session; Supavisor drops startup options. */
+type SessionClient = { query(sql: string, params?: unknown[]): Promise<unknown> };
+
+async function setStatementTimeout(
+  client: SessionClient,
+  statementTimeoutMs: number | undefined,
+  local: boolean,
+): Promise<void> {
+  if (!statementTimeoutMs) return;
+  await client.query(`SELECT set_config($1, $2, ${local ? "true" : "false"})`, [
+    "statement_timeout",
+    `${statementTimeoutMs}ms`,
+  ]);
+}
+
+/** Apply the server-side bound for the lifetime of this database session. */
 export async function setSessionStatementTimeout(
   client: { query(sql: string, params?: unknown[]): Promise<unknown> },
   statementTimeoutMs: number | undefined,
 ): Promise<void> {
-  if (!statementTimeoutMs) return;
-  await client.query("SELECT set_config('statement_timeout', $1, false)", [
-    `${statementTimeoutMs}ms`,
-  ]);
+  await setStatementTimeout(client, statementTimeoutMs, false);
+}
+
+/** Apply the server-side bound locally to the current transaction. */
+export async function setTransactionStatementTimeout(
+  client: SessionClient,
+  statementTimeoutMs: number | undefined,
+): Promise<void> {
+  await setStatementTimeout(client, statementTimeoutMs, true);
 }
 
 export function pgDb(connectionString: string, options: { max?: number; statementTimeoutMs?: number } = {}): Db {
@@ -38,13 +57,17 @@ export function pgDb(connectionString: string, options: { max?: number; statemen
   });
   // An idle client error (e.g. the server restarted) must not crash the process.
   pool.on("error", () => undefined);
-  // Supavisor session mode drops libpq startup options. Apply the bound after
-  // every checkout so direct Postgres and pooled Supabase connections have the
-  // same server-side guarantee before application SQL can run.
+  const configuredClients = new WeakSet<pg.PoolClient>();
+  // Supavisor session mode drops libpq startup options. Apply the bound once to
+  // each physical client. A transaction-mode pool can swap its server session,
+  // so plain query()/exec() there also require an ALTER ROLE default; tx() sets
+  // the bound locally after BEGIN and does not rely on session affinity.
   const checkout = async (): Promise<pg.PoolClient> => {
     const client = await pool.connect();
+    if (configuredClients.has(client)) return client;
     try {
       await setSessionStatementTimeout(client, options.statementTimeoutMs);
+      configuredClients.add(client);
       return client;
     } catch (error) {
       client.release(true);
@@ -66,6 +89,7 @@ export function pgDb(connectionString: string, options: { max?: number; statemen
       let broken = false;
       try {
         await client.query("BEGIN");
+        await setTransactionStatementTimeout(client, options.statementTimeoutMs);
         const q: Tx = {
           async query<R>(sql: string, params?: unknown[]) {
             const result = await client.query(sql, params as unknown[]);
