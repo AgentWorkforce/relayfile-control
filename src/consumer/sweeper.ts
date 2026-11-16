@@ -32,7 +32,7 @@ export class Sweeper {
   private async guard(kind: "fast" | "slow", fn: () => Promise<unknown>): Promise<void> {
     if (this.busy[kind]) return;
     this.busy[kind] = true;
-    // Bounded: the pool's statement_timeout ends the query server-side; this releases the guard
+    // Bounded: the checkout's in-session statement_timeout ends the query server-side; this releases the guard
     // even if a call never settles, so a stuck run cannot stop lease reaping for good.
     const limitMs = kind === "fast" ? 60_000 : Math.max(120_000, this.deps.config.SWEEP_INTERVAL_MS * 2);
     let timer: ReturnType<typeof setTimeout> | undefined;

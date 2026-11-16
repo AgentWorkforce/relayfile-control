@@ -20,21 +20,49 @@ export interface Db extends Queryable {
   close(): Promise<void>;
 }
 
+/** Apply the server-side bound in-session; Supavisor drops startup options. */
+export async function setSessionStatementTimeout(
+  client: { query(sql: string, params?: unknown[]): Promise<unknown> },
+  statementTimeoutMs: number | undefined,
+): Promise<void> {
+  if (!statementTimeoutMs) return;
+  await client.query("SELECT set_config('statement_timeout', $1, false)", [
+    `${statementTimeoutMs}ms`,
+  ]);
+}
+
 export function pgDb(connectionString: string, options: { max?: number; statementTimeoutMs?: number } = {}): Db {
   const pool = new pg.Pool({
     connectionString,
     max: options.max ?? 20,
-    ...(options.statementTimeoutMs ? { statement_timeout: options.statementTimeoutMs } : {}),
   });
   // An idle client error (e.g. the server restarted) must not crash the process.
   pool.on("error", () => undefined);
+  // Supavisor session mode drops libpq startup options. Apply the bound after
+  // every checkout so direct Postgres and pooled Supabase connections have the
+  // same server-side guarantee before application SQL can run.
+  const checkout = async (): Promise<pg.PoolClient> => {
+    const client = await pool.connect();
+    try {
+      await setSessionStatementTimeout(client, options.statementTimeoutMs);
+      return client;
+    } catch (error) {
+      client.release(true);
+      throw error;
+    }
+  };
   return {
     async query<T>(sql: string, params?: unknown[]) {
-      const result = await pool.query(sql, params as unknown[]);
-      return { rows: result.rows as T[], rowCount: result.rowCount ?? 0 };
+      const client = await checkout();
+      try {
+        const result = await client.query(sql, params as unknown[]);
+        return { rows: result.rows as T[], rowCount: result.rowCount ?? 0 };
+      } finally {
+        client.release();
+      }
     },
     async tx<T>(fn: (q: Tx) => Promise<T>): Promise<T> {
-      const client = await pool.connect();
+      const client = await checkout();
       let broken = false;
       try {
         await client.query("BEGIN");
@@ -60,7 +88,12 @@ export function pgDb(connectionString: string, options: { max?: number; statemen
       }
     },
     async exec(sql: string) {
-      await pool.query(sql);
+      const client = await checkout();
+      try {
+        await client.query(sql);
+      } finally {
+        client.release();
+      }
     },
     async close() {
       await pool.end();
