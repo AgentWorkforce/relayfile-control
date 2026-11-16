@@ -7,6 +7,7 @@ import { pgDb } from "../src/db/db.ts";
 const PG_URL = process.env.RELAYFILE_CONTROL_PG_TEST_URL;
 const opts = { skip: PG_URL ? false : "RELAYFILE_CONTROL_PG_TEST_URL not set" };
 const PROTOCOL_V3 = 196_608;
+const SSL_REQUEST_CODE = 80_877_103;
 
 function stripStartupParameters(message: Buffer): Buffer {
   assert.equal(message.readInt32BE(4), PROTOCOL_V3, "expected a PostgreSQL v3 StartupMessage");
@@ -62,6 +63,15 @@ async function startupStrippingProxy(targetUrl: string): Promise<{
       if (startup.length < 4) return;
       const length = startup.readInt32BE(0);
       if (startup.length < length) return;
+      // SSLRequest (sslmode in the test URL): decline TLS like a plaintext
+      // server, then wait for the real StartupMessage. sslmode=prefer proceeds;
+      // sslmode=require fails with pg's own "does not support SSL" error.
+      if (length === 8 && startup.readInt32BE(4) === SSL_REQUEST_CODE) {
+        startup = startup.subarray(8);
+        client.write("N");
+        if (startup.length) onData(Buffer.alloc(0));
+        return;
+      }
       try {
         upstream.write(stripStartupParameters(startup.subarray(0, length)));
         if (startup.length > length) upstream.write(startup.subarray(length));
@@ -83,6 +93,11 @@ async function startupStrippingProxy(targetUrl: string): Promise<{
   });
   const { port } = server.address() as AddressInfo;
   const proxied = new URL(targetUrl);
+  // The proxy hop is plaintext and so is its upstream connection: a TLS test
+  // URL would otherwise make pg refuse the proxy's "no SSL" answer.
+  for (const key of [...proxied.searchParams.keys()]) {
+    if (/^ssl/i.test(key)) proxied.searchParams.delete(key);
+  }
   proxied.hostname = "127.0.0.1";
   proxied.port = String(port);
   return {

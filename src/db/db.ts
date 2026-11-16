@@ -1,4 +1,5 @@
 import pg from "pg";
+import { parse as parseConnectionString } from "pg-connection-string";
 
 export type QueryResult<T> = { rows: T[]; rowCount: number };
 
@@ -62,15 +63,23 @@ export function assertSessionPoolMode(connectionString: string): void {
     // Leave malformed or non-URL connection strings to pg's own validation.
     return;
   }
-  // pg honours `host` and `port` query parameters over the authority part.
-  const param = (name: string) =>
-    [...url.searchParams.entries()].find(([key]) => key.toLowerCase() === name)?.[1]?.trim();
-  const hostname = (param("host") || url.hostname).toLowerCase().replace(/\.+$/, "");
-  const port = param("port") || url.port;
+  // Resolve host and port with the parser pg itself uses, so query-string
+  // overrides (including duplicates) are read exactly as the driver will.
+  let parsed: ReturnType<typeof parseConnectionString>;
+  try {
+    parsed = parseConnectionString(connectionString);
+  } catch {
+    return;
+  }
+  const hostname = String(parsed.host ?? "").trim().toLowerCase().replace(/\.+$/, "");
+  const port = String(parsed.port ?? "").trim();
   const supabaseTransactionPort =
     (hostname === "pooler.supabase.com" || hostname.endsWith(".pooler.supabase.com")) &&
     port === "6543";
-  const pgbouncerValue = param("pgbouncer");
+  // pg ignores `pgbouncer`; it is an operator's declaration, so match any case.
+  const pgbouncerValue = [...url.searchParams.entries()].find(
+    ([key]) => key.toLowerCase() === "pgbouncer",
+  )?.[1];
   const explicitTransactionMode =
     pgbouncerValue !== undefined &&
     ["1", "true", "yes", "on"].includes(pgbouncerValue.trim().toLowerCase());
