@@ -5,8 +5,10 @@ import { Consumer } from "./consumer/consumer.ts";
 import { Sweeper } from "./consumer/sweeper.ts";
 import { pgDb } from "./db/db.ts";
 import { migrate } from "./db/migrate.ts";
+import { observeRoleDatabaseStatementBound } from "./db/statement-bound.ts";
 import { RefreshingEntitlement } from "./entitlement/entitlement.ts";
 import { jsonLogger } from "./observability/log.ts";
+import { Metrics } from "./observability/metrics.ts";
 import { RelayfileClient } from "./relayfile/client.ts";
 import { buildFlows } from "./flows/wiring.ts";
 
@@ -16,6 +18,13 @@ async function main(): Promise<void> {
   if (!config.DATABASE_URL) throw new Error("DATABASE_URL is required");
   logger.event("starting", { area: "server", config: redactedConfig(config) });
 
+  const metrics = new Metrics();
+  await observeRoleDatabaseStatementBound({
+    connectionString: config.DATABASE_URL,
+    configuredBoundMs: config.DATABASE_STATEMENT_TIMEOUT_MS,
+    logger,
+    metrics,
+  });
   const db = pgDb(config.DATABASE_URL, { max: config.DATABASE_POOL_MAX, statementTimeoutMs: config.DATABASE_STATEMENT_TIMEOUT_MS });
   if (config.MIGRATE_ON_START) {
     const applied = await migrate(db);
@@ -39,7 +48,7 @@ async function main(): Promise<void> {
 
   // Flows serve on the public listener of every role (README "Flows API").
   const flows = config.FLOWS_ENABLED ? buildFlows(config, db, logger) : null;
-  const app = createApp({ config, db, logger, entitlement, ...(flows ? { flows: flows.deps } : {}) });
+  const app = createApp({ config, db, logger, metrics, entitlement, ...(flows ? { flows: flows.deps } : {}) });
   flows?.outbox.start();
   const servers: Server[] = [];
   const listen = (handler: Parameters<typeof createServer>[1], address: string, name: string) => {

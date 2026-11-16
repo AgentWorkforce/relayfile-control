@@ -57,6 +57,13 @@ another client. Use a session-mode URL. A role default such as
 `ALTER ROLE ... SET statement_timeout` would require a separate database-owner
 decision; this service does not mutate it.
 
+At startup, the service observes the fresh role/database
+`statement_timeout` default. A zero, unverifiable, or looser-than-configured
+default logs an error and exports the `relayfile_control_database_statement_bound`
+gauge as `0`; a default no greater than `DATABASE_STATEMENT_TIMEOUT_MS` exports `1`.
+This check is bounded to five seconds and is observability only: it neither
+mutates the database default nor refuses startup.
+
 Backpressure is cloud#6175 final by default. Relayfile 429 gets one in-place
 retry for long-deadline providers and none for Slack/Jira; a final 429 becomes
 a queue retry that honours Retry-After (cap 86 400 s). Opt-in switches:
