@@ -62,7 +62,7 @@ export function assertSessionPoolMode(connectionString: string): void {
     // Leave malformed or non-URL connection strings to pg's own validation.
     return;
   }
-  const hostname = url.hostname.toLowerCase();
+  const hostname = url.hostname.toLowerCase().replace(/\.+$/, "");
   const supabaseTransactionPort =
     (hostname === "pooler.supabase.com" || hostname.endsWith(".pooler.supabase.com")) &&
     url.port === "6543";
