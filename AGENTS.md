@@ -1,65 +1,33 @@
-# Agent instructions — relayfile-control
+# Working in relayfile-control
 
-## Service ownership
+```sh
+npm ci
+npm run typecheck
+npm run test
+npm run build
+```
 
-`relayfile-control` owns Relayfile integration ingestion and the Flows service.
-Read the matching [relay-control boundary](https://github.com/AgentWorkforce/relay-control/blob/main/AGENTS.md)
-(local checkout: `../relay-control/AGENTS.md`) before
-changing authentication, workspace policy or credential handling.
+- Own provider ingestion and queues plus Flow definitions, validation, runs, events, artifacts and worker lifecycle. Canonical identity, sessions and credentials stay in relay-control.
+- Authenticate through relay-control introspection and consume `/internal/v1/flows/credentials/*`; preserve workspace, run and reference binding, scopes, audiences, lifetime, revocation and refusal-versus-outage semantics.
+- Flow enrollment tokens and encrypted per-run caches are local domain state, not a second user or workspace credential authority.
+- Use HTTP seams; do not import sibling applications, query the identity database or copy migrations. Update consumers and seam tests with contract changes.
+- Read the README Seams section and `test/flows-seams.test.ts`. Do not automatically mirror to legacy `relay-control/src/flows` or copy Cloud-only UI and readiness.
 
-| Responsibility | Canonical owner |
-| --- | --- |
-| Provider webhook ingress, integration bindings, durable envelope intake, deduplication, queues, retries, backpressure, dead letters and replay | `relayfile-control` |
-| Flow definitions and source validation; runs, steps, events, logs, artifacts and storage; Flows worker enrollment, assignment and lifecycle | `relayfile-control` |
-| People, organizations, workspaces, membership, device/browser login, user sessions, workspace API credentials and introspection | `relay-control` |
-| Session-history access/handoff, Desktop/MCP session control, messaging and remote-agent connections, workspace configuration and canonical credential storage | `relay-control` |
-| Credential-broker server, run-bound subscription/Relayfile credential issuance and revocation, workspace Relaycast binding | `relay-control` |
-| Provider file/record storage, materialization and digests; provider contracts in adapter/provider packages | `relayfile` OSS runtime and its packages |
-| Hosted dashboard/UI, integration setup and the provider-readiness aggregation currently implemented in Cloud | `cloud` (UI ports in `relay-webapp` where implemented) |
+## Agency and guidance
 
-Implement Flows service fixes here, including source-validation and stored
-run/definition lifecycle changes. Do not send those fixes back to the legacy
-`relay-control/src/flows` copy automatically. Provider-specific adapter
-contracts stay in their owning packages; use existing exports rather than
-creating a second hand-maintained declaration or implementation.
+- Act autonomously on routine assigned work; ask forgiveness rather than permission. Preserve explicit production, release and credential gates.
+- For guidance, ask the engineering leads, the agent that spawned you, or the layered owner on Agent Relay.
+- Only a truly pressing or blocking question goes to `khaliq-gant` or `will-washburn` (CODEOWNERS) on Agent Relay.
 
-## The HTTP boundary
+## Cross-repo context
 
-- This repo owns the public `/api/v1/flows`, `/api/v1/workers` and
-  `/api/v1/workflows` route families and their `/cloud/api/v1/...` aliases.
-- User authentication is delegated to `relay-control` through
-  `POST /internal/v1/auth/introspect`; this repo validates the returned
-  workspace, role, scope, audience and lifetime as the existing contract requires.
-  Do not create a parallel user/organization/session authority here.
-- `src/flows/broker.ts` is the client of relay-control's
-  `/internal/v1/flows/credentials/*` server. The issuer, canonical provider
-  logins and workspace Relaycast binding remain in `relay-control`.
-  Preserve workspace/run/reference binding, least-privilege scopes, audiences,
-  revocation and refusal-versus-outage behavior.
-- Flow worker/enrollment credentials and encrypted, scoped per-run credential
-  caches belong here. Receiving a run credential does not transfer authority
-  over the underlying user or workspace credential store.
-- Use documented HTTP seams. Do not import sibling application source,
-  directly query/write the identity database or copy its migrations. Each
-  service owns its database and migrations. Update producers, consumers and
-  seam tests together when a contract changes; see [README — Seams](README.md#seams),
-  `test/flows-seams.test.ts` and `test/flows-relayfile-credential.test.ts`.
+- Before and during changes, understand how this repo fits the wider system; consult its repo map and related-repo docs where available.
+- Check relevant agents’ summaries on Agent Relay and proactively contact owning agents about dependencies, adjacent changes and work in flight.
 
-Service/queue health here is distinct from the hosted provider-readiness
-aggregation in Cloud. Do not copy Cloud's dashboard or GitLab readiness code
-into this service when no equivalent component exists. A later extraction
-needs an explicit owner and contract, not an incidental copy.
+## Pull requests
 
-## Legacy code and cutover
-
-`relay-control`'s 0.5.x implementation still includes Flows handlers. Verify
-each deployed build and ingress before assuming a cutover. That deployment
-state does not change canonical ownership. Any temporary legacy compatibility patch
-must have a verified active deployment and tracked cutover/retirement reason.
-Do not mirror every fix, reintroduce public Flows ownership in relay-control,
-or delete live legacy handlers automatically.
-
-This document does not change routing, migrate data, enable Flows or authorize
-a deployment. Treat those as separate cutover work under the existing release
-policy, preserving active callers and persisted runs. Keep both repos' boundary
-instructions consistent when an explicitly agreed service move changes ownership.
+- Open PRs ready for review, never as drafts. If merging requires Khaliq’s OK, use `merge-train:hold`.
+- Immediately subscribe to PR feedback through Agent Relay using [this skill](https://github.com/AgentWorkforce/skills/blob/main/skills/subscribing-relay-webhooks-and-writebacks/SKILL.md), and verify the subscription.
+- Evaluate every finding. Address applicable feedback and explain declined changes; a PR with unaddressed feedback or conflicts is not ready.
+- When ready, loudly alert the CODEOWNERS and the agent that spawned you on Agent Relay.
+- Keep related older PRs moving by contacting their author agent; if unavailable, escalate to the CODEOWNERS or layered owner.
