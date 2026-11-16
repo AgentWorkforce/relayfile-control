@@ -54,6 +54,14 @@ session mode (`:5432`) preserves the session setting. With a transaction-mode
 pooler, the session-scoped value can be reused by another app sharing the same
 database role; deployments should use a dedicated role.
 
+At startup, URLs that look like transaction poolers (`:6543`,
+`pgbouncer=true`, or Supabase pooler `:6543`) are checked for a non-zero
+role/database `statement_timeout` default. An unbounded or unverifiable default
+logs an error and exports
+`relayfile_control_database_statement_bound{pool_hint="…"} 0`.
+`DATABASE_REQUIRE_STATEMENT_BOUND=true` additionally refuses startup; it is
+off by default until the production pool mode and role default are verified.
+
 Backpressure is cloud#6175 final by default. Relayfile 429 gets one in-place
 retry for long-deadline providers and none for Slack/Jira; a final 429 becomes
 a queue retry that honours Retry-After (cap 86 400 s). Opt-in switches:

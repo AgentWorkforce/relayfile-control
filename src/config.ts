@@ -83,6 +83,8 @@ export const ConfigSchema = z.object({
   DATABASE_POOL_MAX: int(20, 1, 500),
   /** Server-side statement_timeout, applied once per session and locally in every transaction. */
   DATABASE_STATEMENT_TIMEOUT_MS: int(30_000, 1000, 3_600_000),
+  /** Fail startup when a likely transaction pooler has no verified role/database default. */
+  DATABASE_REQUIRE_STATEMENT_BOUND: bool(false),
   MIGRATE_ON_START: bool(false),
 
   // §2.2 secrets (lists allow rotation).
