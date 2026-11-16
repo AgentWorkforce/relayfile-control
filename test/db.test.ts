@@ -1,8 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
-  assertSessionPoolMode,
-  pgDb,
   setSessionStatementTimeout,
   setTransactionStatementTimeout,
 } from "../src/db/db.ts";
@@ -60,26 +58,4 @@ describe("database session settings", () => {
     assert.equal(queried, false);
   });
 
-  it("refuses transaction-mode pooler URLs before a connection is opened", () => {
-    assert.throws(
-      () => pgDb("postgres://user:secret@aws-1-us-east-1.pooler.supabase.com:6543/db"),
-      /transaction-mode PostgreSQL poolers are unsupported/,
-    );
-    assert.throws(
-      () => pgDb("postgres://user:secret@db.example.com:5432/db?PgBouncer=TRUE"),
-      /transaction-mode PostgreSQL poolers are unsupported/,
-    );
-  });
-
-  it("accepts direct and Supabase session-mode URLs", () => {
-    assert.doesNotThrow(() => assertSessionPoolMode("postgres://user:secret@db.example.com:5432/db"));
-    assert.doesNotThrow(() =>
-      assertSessionPoolMode(
-        "postgres://user:secret@aws-1-us-west-2.pooler.supabase.com:5432/db?sslmode=require",
-      ),
-    );
-    assert.doesNotThrow(() =>
-      assertSessionPoolMode("postgres://user:secret@db.example.com:5432/db?pgbouncer=false"),
-    );
-  });
 });

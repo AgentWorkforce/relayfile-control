@@ -50,12 +50,9 @@ Every setting is an environment variable with a finite default; see
 
 `DATABASE_STATEMENT_TIMEOUT_MS` is installed once on each physical database
 session and again with transaction-local scope after every `BEGIN`. Supavisor
-session mode (`:5432`) preserves the session setting. Transaction-mode URLs are
-refused at startup when they use `*.pooler.supabase.com:6543` or declare
-`pgbouncer=true`: a session setting there can miss the next query and leak to
-another client. Use a session-mode URL. A role default such as
-`ALTER ROLE ... SET statement_timeout` would require a separate database-owner
-decision; this service does not mutate it.
+session mode (`:5432`) preserves the session setting. With a transaction-mode
+pooler, the session-scoped value can be reused by another app sharing the same
+database role; deployments should use a dedicated role.
 
 Backpressure is cloud#6175 final by default. Relayfile 429 gets one in-place
 retry for long-deadline providers and none for Slack/Jira; a final 429 becomes
