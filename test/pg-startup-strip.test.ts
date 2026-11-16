@@ -121,6 +121,16 @@ describe("PostgreSQL startup parameters are not a timeout guarantee", opts, () =
         (await db.query<{ statement_timeout: string }>("SHOW statement_timeout")).rows,
         [{ statement_timeout: "50ms" }],
       );
+      const unrelated = pgDb(proxy.url, { max: 1 });
+      try {
+        assert.deepEqual(
+          (await unrelated.query<{ statement_timeout: string }>("SHOW statement_timeout")).rows,
+          [{ statement_timeout: "0" }],
+          "the session setting does not leak into a second pool",
+        );
+      } finally {
+        await unrelated.close();
+      }
       await assert.rejects(db.query("SELECT pg_sleep(0.25)"), isQueryCancelled);
 
       // Prove checkout does not repeat the session SET, while tx() still gets

@@ -50,7 +50,37 @@ export async function setTransactionStatementTimeout(
   await setStatementTimeout(client, statementTimeoutMs, true);
 }
 
+/**
+ * Session-scoped settings are unsafe through transaction poolers: the setting
+ * can miss the next query and leak to another client that gets the backend.
+ */
+export function assertSessionPoolMode(connectionString: string): void {
+  let url: URL;
+  try {
+    url = new URL(connectionString);
+  } catch {
+    // Leave malformed or non-URL connection strings to pg's own validation.
+    return;
+  }
+  const hostname = url.hostname.toLowerCase();
+  const supabaseTransactionPort =
+    (hostname === "pooler.supabase.com" || hostname.endsWith(".pooler.supabase.com")) &&
+    url.port === "6543";
+  const pgbouncerValue = [...url.searchParams.entries()].find(
+    ([key]) => key.toLowerCase() === "pgbouncer",
+  )?.[1];
+  const explicitTransactionMode =
+    pgbouncerValue !== undefined &&
+    ["1", "true", "yes", "on"].includes(pgbouncerValue.trim().toLowerCase());
+  if (supabaseTransactionPort || explicitTransactionMode) {
+    throw new Error(
+      "transaction-mode PostgreSQL poolers are unsupported; use a session-mode URL",
+    );
+  }
+}
+
 export function pgDb(connectionString: string, options: { max?: number; statementTimeoutMs?: number } = {}): Db {
+  assertSessionPoolMode(connectionString);
   const pool = new pg.Pool({
     connectionString,
     max: options.max ?? 20,
