@@ -152,4 +152,18 @@ describe("PostgreSQL startup parameters are not a timeout guarantee", opts, () =
       await proxy.close();
     }
   });
+  it("rejects, rather than crashing the process, when a checked-out connection drops", async () => {
+    const proxy = await startupStrippingProxy(PG_URL!);
+    const db = pgDb(proxy.url, { max: 1, statementTimeoutMs: 10_000 });
+    try {
+      await db.query("SELECT 1");
+      const running = db.query("SELECT pg_sleep(5)");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await proxy.close();
+      await assert.rejects(running);
+      await assert.rejects(db.exec("SELECT 1"));
+    } finally {
+      await db.close();
+    }
+  });
 });

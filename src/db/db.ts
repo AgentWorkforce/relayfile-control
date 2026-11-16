@@ -62,13 +62,15 @@ export function assertSessionPoolMode(connectionString: string): void {
     // Leave malformed or non-URL connection strings to pg's own validation.
     return;
   }
-  const hostname = url.hostname.toLowerCase().replace(/\.+$/, "");
+  // pg honours `host` and `port` query parameters over the authority part.
+  const param = (name: string) =>
+    [...url.searchParams.entries()].find(([key]) => key.toLowerCase() === name)?.[1]?.trim();
+  const hostname = (param("host") || url.hostname).toLowerCase().replace(/\.+$/, "");
+  const port = param("port") || url.port;
   const supabaseTransactionPort =
     (hostname === "pooler.supabase.com" || hostname.endsWith(".pooler.supabase.com")) &&
-    url.port === "6543";
-  const pgbouncerValue = [...url.searchParams.entries()].find(
-    ([key]) => key.toLowerCase() === "pgbouncer",
-  )?.[1];
+    port === "6543";
+  const pgbouncerValue = param("pgbouncer");
   const explicitTransactionMode =
     pgbouncerValue !== undefined &&
     ["1", "true", "yes", "on"].includes(pgbouncerValue.trim().toLowerCase());
@@ -87,6 +89,12 @@ export function pgDb(connectionString: string, options: { max?: number; statemen
   });
   // An idle client error (e.g. the server restarted) must not crash the process.
   pool.on("error", () => undefined);
+  // Nor may one on a checked-out client: pg-pool only listens while a client is
+  // idle (or inside pool.query). The failed query still rejects, and the pool
+  // discards the client on release because it is no longer queryable.
+  pool.on("connect", (client) => {
+    client.on("error", () => undefined);
+  });
   const configuredClients = new WeakSet<pg.PoolClient>();
   // Supavisor session mode drops libpq startup options. Apply the bound once to
   // each physical client. A transaction-mode pool can swap its server session,

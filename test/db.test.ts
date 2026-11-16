@@ -70,6 +70,14 @@ describe("database session settings", () => {
       /transaction-mode PostgreSQL poolers are unsupported/,
     );
     assert.throws(
+      () => pgDb("postgres://user:secret@aws-1-us-west-2.pooler.supabase.com:5432/db?port=6543"),
+      /transaction-mode PostgreSQL poolers are unsupported/,
+    );
+    assert.throws(
+      () => pgDb("postgres://user:secret@localhost:6543/db?host=aws-1-us-west-2.pooler.supabase.com"),
+      /transaction-mode PostgreSQL poolers are unsupported/,
+    );
+    assert.throws(
       () => pgDb("postgres://user:secret@db.example.com:5432/db?PgBouncer=TRUE"),
       /transaction-mode PostgreSQL poolers are unsupported/,
     );
